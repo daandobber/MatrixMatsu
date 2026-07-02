@@ -15,6 +15,11 @@ BUILD ?= build/$(DEVICE)
 FAT ?= 0
 SDKCONFIG_DEFAULTS ?= sdkconfigs/general;sdkconfigs/$(DEVICE)
 SDKCONFIG ?= sdkconfig_$(DEVICE)
+BADGELINK_DIR ?= badgelink_v020
+BADGELINK_TOOLS ?= $(BADGELINK_DIR)/tools
+APP_SLUG ?= matrixmatsu
+APP_TITLE ?= MatrixMatsu
+APP_VERSION ?= 0
 
 ####
 
@@ -54,18 +59,17 @@ all: build
 # Badgelink
 .PHONY: badgelink
 badgelink:
-	rm -rf badgelink
-	git clone https://github.com/badgeteam/esp32-component-badgelink.git badgelink
-	cd badgelink/tools; ./install.sh
+	test -d "$(BADGELINK_TOOLS)" || git clone https://github.com/badgeteam/esp32-component-badgelink.git "$(BADGELINK_DIR)"
+	cd "$(BADGELINK_TOOLS)"; ./install.sh
 
 .PHONY: install
 install: build
 install:
-	cd badgelink/tools; ./badgelink.sh appfs upload application "template application" 0 ../../$(BUILD)/application.bin
+	cd "$(BADGELINK_TOOLS)"; ./badgelink.sh appfs upload "$(APP_SLUG)" "$(APP_TITLE)" "$(APP_VERSION)" "../../$(BUILD)/application.bin"
 
 .PHONY: run
 run:
-	cd badgelink/tools; ./badgelink.sh start application
+	cd "$(BADGELINK_TOOLS)"; ./badgelink.sh start "$(APP_SLUG)"
 
 # Preparation
 

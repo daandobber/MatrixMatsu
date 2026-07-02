@@ -7,6 +7,7 @@ endif()
 idf_component_register(
 	SRCS
 		"main.c"
+		"matrix_client.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
@@ -14,6 +15,11 @@ idf_component_register(
 		bt
 		badge-bsp
 		tanmatsu-wifi
+		esp_http_client
+		esp-tls
+		mbedtls
+		json
+		esp_timer
 		${extra_requires}
 	INCLUDE_DIRS
 		"."

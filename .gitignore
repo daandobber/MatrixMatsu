@@ -1,4 +1,6 @@
 build/
+dist/
+emoji_assets/
 tags
 main/kbelf_lib.c
 sdkconfig.old
@@ -17,7 +19,7 @@ sdkconfig
 .submodules_update_done
 sdkconfig_*
 REPOLAYOUT.md
-CLAUDE.md
 components/badgeteam__badgelink/
 .vscode
 badgelink
+badgelink_v020
