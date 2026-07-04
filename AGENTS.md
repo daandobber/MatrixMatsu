@@ -42,6 +42,32 @@ Build output:
 build/tanmatsu/application.bin
 ```
 
+## Fresh Bootstrap
+
+If a user starts from only the starter kit or from a clean folder, use:
+
+```powershell
+New-Item -ItemType Directory -Force MatrixMatsu-bootstrap
+Set-Location MatrixMatsu-bootstrap
+Invoke-WebRequest https://raw.githubusercontent.com/daandobber/MatrixMatsu/main/starter-kit/bootstrap-matrixmatsu.ps1 -OutFile bootstrap-matrixmatsu.ps1
+powershell -ExecutionPolicy Bypass -File .\bootstrap-matrixmatsu.ps1 -SetupBadgeLink -SetupSdk -CloneTemplateToo
+```
+
+If this repository is already cloned and the local starter kit exists:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\starter-kit\bootstrap-matrixmatsu.ps1 -SetupBadgeLink
+```
+
+Add `-SetupSdk` when ESP-IDF is missing. Add `-CloneTemplateToo` when the user
+wants the original Nicolai template cloned as a sibling reference checkout.
+
+The bootstrap script clones MatrixMatsu and configures the original template as:
+
+```text
+template -> https://github.com/Nicolai-Electronics/tanmatsu-template.git
+```
+
 ## BadgeLink Install
 
 With the Tanmatsu connected in BadgeLink mode:
@@ -96,4 +122,3 @@ dist/matrixmatsu-app-repository-package.zip
 
 For firmware work, at minimum run the Tanmatsu build above. If the user is
 testing on hardware, install via BadgeLink after a successful build.
-

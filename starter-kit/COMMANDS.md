@@ -2,11 +2,55 @@
 
 Run these from the repository root in PowerShell.
 
+## Bootstrap From Scratch
+
+If you do not have the repository yet, download the bootstrap script first:
+
+```powershell
+New-Item -ItemType Directory -Force MatrixMatsu-bootstrap
+Set-Location MatrixMatsu-bootstrap
+Invoke-WebRequest https://raw.githubusercontent.com/daandobber/MatrixMatsu/main/starter-kit/bootstrap-matrixmatsu.ps1 -OutFile bootstrap-matrixmatsu.ps1
+powershell -ExecutionPolicy Bypass -File .\bootstrap-matrixmatsu.ps1 -SetupBadgeLink -SetupSdk -CloneTemplateToo
+```
+
+If you already have this starter kit folder locally and want to pull in
+everything needed for a MatrixMatsu workspace:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\starter-kit\bootstrap-matrixmatsu.ps1 -SetupBadgeLink
+```
+
+If the machine does not have ESP-IDF yet, include `-SetupSdk`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\starter-kit\bootstrap-matrixmatsu.ps1 -SetupBadgeLink -SetupSdk
+```
+
+If you also want the original Nicolai template cloned as a separate reference
+repo next to MatrixMatsu:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\starter-kit\bootstrap-matrixmatsu.ps1 -SetupBadgeLink -SetupSdk -CloneTemplateToo
+```
+
+The script clones:
+
+```text
+https://github.com/daandobber/MatrixMatsu.git
+```
+
+It also configures the original template as a git remote named `template`:
+
+```text
+https://github.com/Nicolai-Electronics/tanmatsu-template.git
+```
+
 ## Build Tanmatsu Firmware
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'
 $env:PYTHONUTF8='1'
+$env:IDF_TOOLS_PATH="$(Get-Location)\esp-idf-tools"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 . .\esp-idf\export.ps1
 idf.py --no-ccache -B build/tanmatsu build -DDEVICE=tanmatsu -DSDKCONFIG_DEFAULTS='sdkconfigs/general;sdkconfigs/tanmatsu' -DSDKCONFIG=sdkconfig_tanmatsu -DIDF_TARGET=esp32p4 -DFAT=0
@@ -74,3 +118,9 @@ Push to MatrixMatsu:
 git push matrixmatsu main
 ```
 
+Fetch upstream template changes for comparison:
+
+```powershell
+git fetch template
+git diff template/main..main
+```
