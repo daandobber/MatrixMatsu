@@ -8,6 +8,7 @@ Read these files first:
 - `AGENT_PROMPT.md`: pasteable prompt for a new AI session.
 - `COMMANDS.md`: exact build, install, package, and git commands.
 - `PROJECT_MAP.md`: where important code and scripts live.
+- `HARDWARE.md`: Tanmatsu hardware specs relevant to app development.
 - `bootstrap-matrixmatsu.ps1`: one-command bootstrap for a clean machine or
   fresh folder.
 

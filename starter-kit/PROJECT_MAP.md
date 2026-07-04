@@ -18,6 +18,7 @@
 - `tools/make-emoji-assets.ps1`: generate emoji source assets.
 - `tools/make-emoji-pack.ps1`: pack emoji assets.
 - `tools/package-app-repository.ps1`: create app repository folder and zip.
+- `starter-kit/HARDWARE.md`: app-development hardware summary for Tanmatsu.
 
 ## Important Generated Or External Folders
 
@@ -37,4 +38,3 @@
 - Images are downloaded and opened in a full-screen viewer.
 - PNG is decoded locally through the image viewer.
 - JPG is decoded locally through `esp_jpeg` software decoding.
-

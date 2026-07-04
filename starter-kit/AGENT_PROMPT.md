@@ -26,6 +26,7 @@ Useful first commands:
 git status -sb
 Get-Content AGENTS.md
 Get-Content starter-kit\COMMANDS.md
+Get-Content starter-kit\HARDWARE.md
 ```
 
 Bootstrap from scratch when needed:
