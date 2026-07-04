@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 #include "hal/lcd_types.h"
 #include "audio_player.h"
+#include "image_viewer.h"
 #include "matrix_client.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -78,6 +79,7 @@ typedef enum {
     APP_SCREEN_LOGIN = 0,
     APP_SCREEN_ROOM_LIST,
     APP_SCREEN_CHAT,
+    APP_SCREEN_IMAGE_VIEWER,
     APP_SCREEN_EMOJI_PICKER,
     APP_SCREEN_MENU,
     APP_SCREEN_SETTINGS,
@@ -117,6 +119,20 @@ static int  chat_scroll_offset  = 0;
 static int  chat_selected_message = -1;
 static int  emoji_selected      = 0;
 static int  emoji_scroll        = 0;
+static pax_buf_t viewed_image = {0};
+static bool viewed_image_valid = false;
+static char viewed_image_label[MATRIX_BODY_LEN] = "";
+static char viewed_image_error[96] = "";
+static char pending_image_event_id[MATRIX_EVENT_ID_LEN] = "";
+static volatile bool image_decode_busy = false;
+static volatile bool image_decode_ready = false;
+
+typedef struct {
+    uint8_t *data;
+    size_t   data_len;
+    char     mimetype[MATRIX_MEDIA_MIMETYPE_LEN];
+    char     label[MATRIX_BODY_LEN];
+} image_decode_request_t;
 
 // Menu/settings state
 static int menu_selected     = 0;
@@ -149,6 +165,7 @@ static bool handle_global_hotkeys(bsp_input_event_t *event);
 static bool handle_input_login(bsp_input_event_t *event);
 static bool handle_input_room_list(bsp_input_event_t *event);
 static bool handle_input_chat(bsp_input_event_t *event);
+static bool handle_input_image_viewer(bsp_input_event_t *event);
 static bool handle_input_emoji_picker(bsp_input_event_t *event);
 static bool handle_input_menu(bsp_input_event_t *event);
 static bool handle_input_settings(bsp_input_event_t *event);
@@ -160,6 +177,7 @@ static void render_room_list(void);
 static void render_chat_frame(bool do_blit);
 static void render_chat(void);
 static void render_chat_input_only(void);
+static void render_image_viewer(void);
 static void render_emoji_picker(void);
 static void render_menu(void);
 static void render_settings(void);
@@ -2286,21 +2304,115 @@ static matrix_message_t *chat_message_at_locked(matrix_room_t *room, int index) 
                              : (room != NULL && index >= 0 && index < room->message_count ? &room->messages[index] : NULL);
 }
 
-static void request_selected_audio(void) {
-    if (chat_room_id[0] == '\0' || chat_selected_message < 0) return;
+static bool get_selected_event_id(char *event_id, size_t event_id_len) {
+    if (event_id == NULL || event_id_len == 0) return false;
+    event_id[0] = '\0';
+    if (chat_room_id[0] == '\0' || chat_selected_message < 0) return false;
 
-    char event_id[MATRIX_EVENT_ID_LEN] = "";
     matrix_lock();
     int room_index = matrix_find_room_index_by_id(chat_room_id);
     matrix_room_t *room = matrix_get_room(room_index);
     matrix_message_t *msg = chat_message_at_locked(room, chat_selected_message);
     if (msg != NULL && msg->event_id[0] != '\0') {
-        snprintf(event_id, sizeof(event_id), "%s", msg->event_id);
+        snprintf(event_id, event_id_len, "%s", msg->event_id);
     }
     matrix_unlock();
+    return event_id[0] != '\0';
+}
 
-    if (event_id[0] != '\0') {
-        matrix_request_audio_download(chat_room_id, event_id);
+static void image_decode_task(void *arg) {
+    image_decode_request_t *req = (image_decode_request_t *)arg;
+    if (req == NULL) {
+        image_decode_busy = false;
+        image_decode_ready = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    pax_buf_t decoded = {0};
+    char error[sizeof(viewed_image_error)] = "";
+    esp_err_t res = image_viewer_decode(req->data, req->data_len, req->mimetype, &decoded, error, sizeof(error));
+    heap_caps_free(req->data);
+
+    if (res == ESP_OK) {
+        viewed_image = decoded;
+        viewed_image_valid = true;
+        viewed_image_error[0] = '\0';
+    } else {
+        viewed_image_valid = false;
+        memset(&viewed_image, 0, sizeof(viewed_image));
+        snprintf(viewed_image_error, sizeof(viewed_image_error), "%.80s", error[0] != '\0' ? error : esp_err_to_name(res));
+    }
+    snprintf(viewed_image_label, sizeof(viewed_image_label), "%.383s", req->label[0] != '\0' ? req->label : "image");
+    free(req);
+    image_decode_busy = false;
+    image_decode_ready = true;
+    vTaskDelete(NULL);
+}
+
+static bool open_cached_image(const char *event_id) {
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    char mimetype[MATRIX_MEDIA_MIMETYPE_LEN] = "";
+    char label[MATRIX_BODY_LEN] = "";
+    if (matrix_copy_cached_image(event_id, &data, &data_len, mimetype, sizeof(mimetype), label, sizeof(label)) != ESP_OK) {
+        return false;
+    }
+
+    if (image_decode_busy) {
+        heap_caps_free(data);
+        return true;
+    }
+    if (viewed_image_valid) {
+        image_viewer_destroy(&viewed_image);
+        viewed_image_valid = false;
+    }
+    snprintf(viewed_image_label, sizeof(viewed_image_label), "%s", label[0] != '\0' ? label : "image");
+    snprintf(viewed_image_error, sizeof(viewed_image_error), "decoding image");
+    image_decode_request_t *req = calloc(1, sizeof(*req));
+    if (req == NULL) {
+        heap_caps_free(data);
+        snprintf(viewed_image_error, sizeof(viewed_image_error), "image no mem");
+        screen = APP_SCREEN_IMAGE_VIEWER;
+        return true;
+    }
+    req->data = data;
+    req->data_len = data_len;
+    snprintf(req->mimetype, sizeof(req->mimetype), "%s", mimetype);
+    snprintf(req->label, sizeof(req->label), "%s", label[0] != '\0' ? label : "image");
+    pending_image_event_id[0] = '\0';
+    image_decode_busy = true;
+    image_decode_ready = false;
+    screen = APP_SCREEN_IMAGE_VIEWER;
+    BaseType_t ok = xTaskCreate(image_decode_task, "image_decode", 32768, req, 4, NULL);
+    if (ok != pdPASS) {
+        image_decode_busy = false;
+        image_decode_ready = true;
+        heap_caps_free(req->data);
+        free(req);
+        snprintf(viewed_image_error, sizeof(viewed_image_error), "image task failed");
+    }
+    return true;
+}
+
+static void request_selected_media(void) {
+    char event_id[MATRIX_EVENT_ID_LEN] = "";
+    if (!get_selected_event_id(event_id, sizeof(event_id))) return;
+
+    if (open_cached_image(event_id)) return;
+    snprintf(pending_image_event_id, sizeof(pending_image_event_id), "%s", event_id);
+    if (matrix_request_media_download(chat_room_id, event_id) != ESP_OK) {
+        pending_image_event_id[0] = '\0';
+    }
+}
+
+static void maybe_open_pending_image(void) {
+    if (screen != APP_SCREEN_CHAT || pending_image_event_id[0] == '\0') return;
+    const char *status = matrix_get_audio_status(pending_image_event_id);
+    if (status != NULL && strcmp(status, "image ready") == 0) {
+        open_cached_image(pending_image_event_id);
+    } else if (status != NULL && (strcmp(status, "not media") == 0 || strstr(status, "failed") != NULL)) {
+        pending_image_event_id[0] = '\0';
     }
 }
 
@@ -2391,7 +2503,7 @@ static bool handle_input_chat(bsp_input_event_t *event) {
                 return true;
             case BSP_INPUT_NAVIGATION_KEY_RETURN:
                 if (compose_buffer[0] != '\0') send_current_message();
-                else request_selected_audio();
+                else request_selected_media();
                 return true;
             default:
                 return false;
@@ -2405,7 +2517,7 @@ static bool handle_input_chat(bsp_input_event_t *event) {
         }
         if (ascii == '\r' || ascii == '\n') {
             if (compose_buffer[0] != '\0') send_current_message();
-            else request_selected_audio();
+            else request_selected_media();
             return true;
         }
         if ((unsigned char)ascii >= 0x20 || (event->args_keyboard.utf8 != NULL && event->args_keyboard.utf8[0] != '\0')) {
@@ -2863,6 +2975,64 @@ static void render_settings(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Image viewer                                                               */
+/* -------------------------------------------------------------------------- */
+
+static bool handle_input_image_viewer(bsp_input_event_t *event) {
+    if (event->type == INPUT_EVENT_TYPE_NAVIGATION && event->args_navigation.state) {
+        switch (event->args_navigation.key) {
+            case BSP_INPUT_NAVIGATION_KEY_ESC:
+            case BSP_INPUT_NAVIGATION_KEY_RETURN:
+            case BSP_INPUT_NAVIGATION_KEY_BACKSPACE:
+                screen = APP_SCREEN_CHAT;
+                return true;
+            default:
+                return false;
+        }
+    }
+    if (event->type == INPUT_EVENT_TYPE_KEYBOARD) {
+        char ascii = event->args_keyboard.ascii;
+        if (ascii == '\r' || ascii == '\n' || ascii == '\b') {
+            screen = APP_SCREEN_CHAT;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void render_image_viewer(void) {
+    pax_background(&fb, BLACK);
+    float w = pax_buf_get_widthf(&fb);
+    float h = pax_buf_get_heightf(&fb);
+    float footer_h = g_line_h + 16.0f;
+
+    if (viewed_image_valid && viewed_image.buf != NULL && viewed_image.width > 0 && viewed_image.height > 0) {
+        float max_w = w;
+        float max_h = h - footer_h;
+        float scale_x = max_w / (float)viewed_image.width;
+        float scale_y = max_h / (float)viewed_image.height;
+        float scale = scale_x < scale_y ? scale_x : scale_y;
+        if (scale > 1.0f) scale = 1.0f;
+        float draw_w = (float)viewed_image.width * scale;
+        float draw_h = (float)viewed_image.height * scale;
+        float x = (w - draw_w) / 2.0f;
+        float y = (max_h - draw_h) / 2.0f;
+        pax_draw_image_sized(&fb, &viewed_image, x, y, draw_w, draw_h);
+    } else {
+        const char *msg = viewed_image_error[0] != '\0' ? viewed_image_error : "image not loaded";
+        pax_vec2f size = pax_text_size(pax_font_sky_mono, TITLE_FONT_SIZE, msg);
+        pax_draw_text(&fb, TERM_RED, pax_font_sky_mono, TITLE_FONT_SIZE, (w - size.x) / 2.0f, (h - size.y) / 2.0f, msg);
+    }
+
+    pax_simple_rect(&fb, BLACK, 0, h - footer_h, w, footer_h);
+    pax_outline_rect(&fb, TERM_DIM, 0, h - footer_h, w, footer_h);
+    char footer[160];
+    snprintf(footer, sizeof(footer), "%.140s", viewed_image_label[0] != '\0' ? viewed_image_label : "image");
+    pax_draw_text(&fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, 12, h - footer_h + 8, footer);
+    blit();
+}
+
+/* -------------------------------------------------------------------------- */
 /* Dispatch                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -2886,6 +3056,9 @@ static bool handle_global_hotkeys(bsp_input_event_t *event) {
             return true;
         }
         case BSP_INPUT_NAVIGATION_KEY_ESC:
+            if (screen == APP_SCREEN_IMAGE_VIEWER) {
+                return false;
+            }
             if (screen == APP_SCREEN_EMOJI_PICKER) {
                 return false;
             }
@@ -2930,6 +3103,7 @@ static void render(void) {
         case APP_SCREEN_LOGIN: render_login(); break;
         case APP_SCREEN_ROOM_LIST: render_room_list(); break;
         case APP_SCREEN_CHAT: render_chat(); break;
+        case APP_SCREEN_IMAGE_VIEWER: render_image_viewer(); break;
         case APP_SCREEN_EMOJI_PICKER: render_emoji_picker(); break;
         case APP_SCREEN_MENU: render_menu(); break;
         case APP_SCREEN_SETTINGS: render_settings(); break;
@@ -3058,6 +3232,7 @@ void app_main(void) {
                     case APP_SCREEN_LOGIN: need_redraw = handle_input_login(&event); break;
                     case APP_SCREEN_ROOM_LIST: need_redraw = handle_input_room_list(&event); break;
                     case APP_SCREEN_CHAT: need_redraw = handle_input_chat(&event); break;
+                    case APP_SCREEN_IMAGE_VIEWER: need_redraw = handle_input_image_viewer(&event); break;
                     case APP_SCREEN_EMOJI_PICKER: need_redraw = handle_input_emoji_picker(&event); break;
                     case APP_SCREEN_MENU: need_redraw = handle_input_menu(&event); break;
                     case APP_SCREEN_SETTINGS: need_redraw = handle_input_settings(&event); break;
@@ -3071,6 +3246,12 @@ void app_main(void) {
         was_logging_in = login_in_progress;
 
         if (matrix_consume_dirty()) {
+            maybe_open_pending_image();
+            need_redraw = true;
+        }
+
+        if (image_decode_ready) {
+            image_decode_ready = false;
             need_redraw = true;
         }
 

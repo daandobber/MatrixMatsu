@@ -7,6 +7,7 @@ endif()
 idf_component_register(
 	SRCS
 		"audio_player_decode.cpp"
+		"image_viewer.c"
 		"main.c"
 		"matrix_client.c"
 	PRIV_REQUIRES
@@ -19,6 +20,9 @@ idf_component_register(
 		micro-opus
 		esp_http_client
 		esp_driver_i2s
+		esp_driver_jpeg
+		esp_jpeg
+		esp_rom
 		esp-tls
 		mbedtls
 		json
