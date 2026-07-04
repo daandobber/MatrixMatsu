@@ -3,3 +3,4 @@ dependencies:
   badgeteam/badge-bsp: "^0.9.9"
   nicolaielectronics/tanmatsu-wifi: "^1.1.2"
   robotman2412/pax-gfx: "^2.1.0"
+  esphome/micro-opus: "*"

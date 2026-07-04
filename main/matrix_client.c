@@ -7,6 +7,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 
+#include "audio_player.h"
 #include "cJSON.h"
 #include "driver/sdmmc_host.h"
 #include "esp_crt_bundle.h"
@@ -59,6 +60,16 @@ typedef struct {
 } matrix_history_request_t;
 
 typedef struct {
+    char room_id[MATRIX_ROOM_ID_LEN];
+    char event_id[MATRIX_EVENT_ID_LEN];
+} matrix_media_request_t;
+
+typedef struct {
+    char event_id[MATRIX_EVENT_ID_LEN];
+    char text[MATRIX_AUDIO_STATUS_LEN];
+} matrix_audio_status_t;
+
+typedef struct {
     char homeserver[MATRIX_HOMESERVER_LEN];
     char user_id[MATRIX_USER_ID_LEN];
     char access_token[MATRIX_TOKEN_LEN];
@@ -84,6 +95,8 @@ typedef struct {
     char          active_members_room_id[MATRIX_ROOM_ID_LEN];
     matrix_member_t active_members[MATRIX_ACTIVE_MEMBERS];
     int           active_member_count;
+    matrix_audio_status_t audio_status[8];
+    int           audio_status_next;
     char          pending_invites[MATRIX_MAX_ROOMS][MATRIX_ROOM_ID_LEN];
     int           pending_invite_count;
 
@@ -350,6 +363,14 @@ typedef struct {
 } http_response_buffer_t;
 
 typedef struct {
+    uint8_t *data;
+    size_t   len;
+    size_t   cap;
+    size_t   max_bytes;
+    esp_err_t err;
+} http_media_buffer_t;
+
+typedef struct {
     uint32_t events;
     uint32_t messages;
 } matrix_sync_parse_counts_t;
@@ -385,6 +406,72 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
     memcpy(resp->buf + resp->len, evt->data, evt->data_len);
     resp->len += evt->data_len;
     resp->buf[resp->len] = '\0';
+    return ESP_OK;
+}
+
+static void matrix_set_audio_status_locked(const char *event_id, const char *text) {
+    if (s_session == NULL || event_id == NULL || event_id[0] == '\0') return;
+    const char *status = (text != NULL && text[0] != '\0') ? text : "";
+
+    for (int i = 0; i < (int)(sizeof(s_session->audio_status) / sizeof(s_session->audio_status[0])); i++) {
+        if (strcmp(s_session->audio_status[i].event_id, event_id) == 0) {
+            snprintf(s_session->audio_status[i].text, sizeof(s_session->audio_status[i].text), "%s", status);
+            s_session->dirty = true;
+            return;
+        }
+    }
+
+    int slot = s_session->audio_status_next++ % (int)(sizeof(s_session->audio_status) / sizeof(s_session->audio_status[0]));
+    snprintf(s_session->audio_status[slot].event_id, sizeof(s_session->audio_status[slot].event_id), "%s", event_id);
+    snprintf(s_session->audio_status[slot].text, sizeof(s_session->audio_status[slot].text), "%s", status);
+    s_session->dirty = true;
+}
+
+static void matrix_set_audio_status(const char *event_id, const char *text) {
+    matrix_lock();
+    matrix_set_audio_status_locked(event_id, text);
+    matrix_unlock();
+}
+
+static uint8_t *matrix_realloc_media_buffer(uint8_t *old_data, size_t old_len, size_t new_cap) {
+    uint8_t *new_data = heap_caps_realloc(old_data, new_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (new_data != NULL) return new_data;
+
+    new_data = heap_caps_malloc(new_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (new_data == NULL) new_data = heap_caps_malloc(new_cap, MALLOC_CAP_8BIT);
+    if (new_data == NULL) return NULL;
+    if (old_data != NULL && old_len > 0) memcpy(new_data, old_data, old_len);
+    heap_caps_free(old_data);
+    return new_data;
+}
+
+static esp_err_t http_media_event_handler(esp_http_client_event_t *evt) {
+    if (evt->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
+    http_media_buffer_t *sink = (http_media_buffer_t *)evt->user_data;
+    if (sink == NULL || evt->data_len <= 0) return ESP_OK;
+
+    size_t data_len = (size_t)evt->data_len;
+    if (sink->len + data_len > sink->max_bytes) {
+        sink->err = ESP_ERR_INVALID_SIZE;
+        return ESP_FAIL;
+    }
+
+    size_t needed = sink->len + data_len;
+    if (needed > sink->cap) {
+        size_t new_cap = sink->cap == 0 ? 16384 : sink->cap * 2;
+        if (new_cap < needed) new_cap = needed;
+        if (new_cap > sink->max_bytes) new_cap = sink->max_bytes;
+        uint8_t *new_data = matrix_realloc_media_buffer(sink->data, sink->len, new_cap);
+        if (new_data == NULL) {
+            sink->err = ESP_ERR_NO_MEM;
+            return ESP_FAIL;
+        }
+        sink->data = new_data;
+        sink->cap  = new_cap;
+    }
+
+    memcpy(sink->data + sink->len, evt->data, data_len);
+    sink->len += data_len;
     return ESP_OK;
 }
 
@@ -474,6 +561,54 @@ static esp_err_t matrix_http_request(
     return ESP_OK;
 }
 
+static esp_err_t matrix_http_download_buffer(
+    const char *url, const char *bearer_token, size_t max_bytes, uint8_t **out_data, size_t *out_len, int *out_status
+) {
+    if (out_data != NULL) *out_data = NULL;
+    if (out_len != NULL) *out_len = 0;
+    if (out_status != NULL) *out_status = 0;
+    if (url == NULL || out_data == NULL || out_len == NULL || max_bytes == 0) return ESP_ERR_INVALID_ARG;
+
+    http_media_buffer_t sink = {
+        .max_bytes = max_bytes,
+        .err       = ESP_OK,
+    };
+    esp_http_client_config_t config = {
+        .url               = url,
+        .method            = HTTP_METHOD_GET,
+        .timeout_ms        = HTTP_TIMEOUT_MS,
+        .event_handler     = http_media_event_handler,
+        .user_data         = &sink,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) return ESP_FAIL;
+
+    if (bearer_token != NULL && bearer_token[0] != '\0') {
+        char auth[MATRIX_TOKEN_LEN + 32];
+        snprintf(auth, sizeof(auth), "Bearer %s", bearer_token);
+        esp_http_client_set_header(client, "Authorization", auth);
+    }
+
+    esp_err_t res = esp_http_client_perform(client);
+    int status = 0;
+    if (res == ESP_OK) {
+        status = esp_http_client_get_status_code(client);
+        if (out_status != NULL) *out_status = status;
+    }
+    esp_http_client_cleanup(client);
+
+    if (res == ESP_OK && sink.err != ESP_OK) res = sink.err;
+    if (res != ESP_OK || status != 200 || sink.len == 0) {
+        heap_caps_free(sink.data);
+        return res == ESP_OK ? ESP_FAIL : res;
+    }
+
+    *out_data = sink.data;
+    *out_len  = sink.len;
+    return ESP_OK;
+}
+
 static bool matrix_url_encode(const char *in, char *out, size_t out_len) {
     static const char *hex = "0123456789ABCDEF";
     size_t             o   = 0;
@@ -493,6 +628,35 @@ static bool matrix_url_encode(const char *in, char *out, size_t out_len) {
     }
     out[o] = '\0';
     return in[i] == '\0';
+}
+
+static bool matrix_mxc_to_download_url(const char *homeserver, const char *mxc, char *out, size_t out_len) {
+    if (homeserver == NULL || homeserver[0] == '\0' || mxc == NULL || strncmp(mxc, "mxc://", 6) != 0) {
+        return false;
+    }
+    const char *server = mxc + 6;
+    const char *slash  = strchr(server, '/');
+    if (slash == NULL || slash == server || slash[1] == '\0') return false;
+
+    char server_raw[96];
+    char media_raw[160];
+    size_t server_len = (size_t)(slash - server);
+    if (server_len >= sizeof(server_raw)) return false;
+    memcpy(server_raw, server, server_len);
+    server_raw[server_len] = '\0';
+    snprintf(media_raw, sizeof(media_raw), "%s", slash + 1);
+
+    char server_enc[sizeof(server_raw) * 3];
+    char media_enc[sizeof(media_raw) * 3];
+    if (!matrix_url_encode(server_raw, server_enc, sizeof(server_enc)) ||
+        !matrix_url_encode(media_raw, media_enc, sizeof(media_enc))) {
+        return false;
+    }
+
+    int len = snprintf(
+        out, out_len, "%s/_matrix/client/v1/media/download/%s/%s", homeserver, server_enc, media_enc
+    );
+    return len > 0 && len < (int)out_len;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2038,6 +2202,116 @@ static void process_joined_members_body(const char *room_id, const char *body) {
     cJSON_Delete(root);
 }
 
+static void media_download_task(void *arg) {
+    matrix_media_request_t req = {0};
+    if (arg != NULL) {
+        memcpy(&req, arg, sizeof(req));
+        free(arg);
+    }
+    if (req.room_id[0] == '\0' || req.event_id[0] == '\0') {
+        vTaskDelete(NULL);
+        return;
+    }
+    matrix_set_audio_status(req.event_id, "downloading");
+
+    char homeserver_copy[MATRIX_HOMESERVER_LEN] = "";
+    char token_copy[MATRIX_TOKEN_LEN] = "";
+    matrix_lock();
+    if (s_session != NULL) {
+        snprintf(homeserver_copy, sizeof(homeserver_copy), "%s", s_session->homeserver);
+        snprintf(token_copy, sizeof(token_copy), "%s", s_session->access_token);
+    }
+    matrix_unlock();
+
+    if (homeserver_copy[0] == '\0' || token_copy[0] == '\0') {
+        matrix_set_audio_status(req.event_id, "no session");
+        matrix_set_last_error("audio: no session");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    char room_enc[MATRIX_ROOM_ID_LEN * 3];
+    char event_enc[MATRIX_EVENT_ID_LEN * 3];
+    if (!matrix_url_encode(req.room_id, room_enc, sizeof(room_enc)) ||
+        !matrix_url_encode(req.event_id, event_enc, sizeof(event_enc))) {
+        matrix_set_audio_status(req.event_id, "bad event id");
+        matrix_set_last_error("audio: bad event id");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    char event_url[MATRIX_HOMESERVER_LEN + MATRIX_ROOM_ID_LEN * 3 + MATRIX_EVENT_ID_LEN * 3 + 64];
+    snprintf(event_url, sizeof(event_url), "%s/_matrix/client/v3/rooms/%s/event/%s", homeserver_copy, room_enc, event_enc);
+
+    char *event_body = NULL;
+    int status = 0;
+    char detail[96];
+    esp_err_t res = matrix_http_request("GET", event_url, token_copy, NULL, &event_body, &status, detail, sizeof(detail));
+    if (res != ESP_OK || status != 200 || event_body == NULL) {
+        matrix_set_audio_status(req.event_id, "event fetch failed");
+        matrix_set_last_error("audio: event fetch failed");
+        free(event_body);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    cJSON *root = cJSON_Parse(event_body);
+    free(event_body);
+    cJSON *content = root ? cJSON_GetObjectItemCaseSensitive(root, "content") : NULL;
+    cJSON *msgtype = content ? cJSON_GetObjectItemCaseSensitive(content, "msgtype") : NULL;
+    cJSON *mxc     = content ? cJSON_GetObjectItemCaseSensitive(content, "url") : NULL;
+    cJSON *body    = content ? cJSON_GetObjectItemCaseSensitive(content, "body") : NULL;
+    cJSON *info    = content ? cJSON_GetObjectItemCaseSensitive(content, "info") : NULL;
+    cJSON *mime    = info ? cJSON_GetObjectItemCaseSensitive(info, "mimetype") : NULL;
+    cJSON *size    = info ? cJSON_GetObjectItemCaseSensitive(info, "size") : NULL;
+
+    if (!cJSON_IsString(msgtype) || strcmp(msgtype->valuestring, "m.audio") != 0 ||
+        !cJSON_IsString(mxc) || strncmp(mxc->valuestring, "mxc://", 6) != 0) {
+        cJSON_Delete(root);
+        matrix_set_audio_status(req.event_id, "not audio");
+        matrix_set_last_error("audio: not an audio event");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    char media_url[MATRIX_HOMESERVER_LEN + 700];
+    if (!matrix_mxc_to_download_url(homeserver_copy, mxc->valuestring, media_url, sizeof(media_url))) {
+        cJSON_Delete(root);
+        matrix_set_audio_status(req.event_id, "bad mxc url");
+        matrix_set_last_error("audio: bad mxc url");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const char *mimetype = cJSON_IsString(mime) ? mime->valuestring : "audio/ogg";
+    const char *label = cJSON_IsString(body) ? body->valuestring : "audio";
+    size_t max_bytes = 2 * 1024 * 1024;
+    if (cJSON_IsNumber(size) && size->valuedouble > 0 && size->valuedouble < (double)max_bytes) {
+        max_bytes = (size_t)size->valuedouble + 4096;
+    }
+
+    uint8_t *audio_data = NULL;
+    size_t audio_len = 0;
+    status = 0;
+    res = matrix_http_download_buffer(media_url, token_copy, max_bytes, &audio_data, &audio_len, &status);
+    if (res == ESP_OK) {
+        matrix_set_audio_status(req.event_id, "downloaded");
+        res = audio_player_play_buffer(audio_data, audio_len, mimetype, label, true);
+        if (res != ESP_OK) {
+            matrix_set_audio_status(req.event_id, audio_player_last_error());
+            matrix_set_last_error(audio_player_last_error());
+        } else {
+            matrix_set_audio_status(req.event_id, "played");
+        }
+    } else {
+        matrix_set_audio_status(req.event_id, "download failed");
+        matrix_set_last_error("audio: download failed");
+    }
+    heap_caps_free(audio_data);
+    cJSON_Delete(root);
+    vTaskDelete(NULL);
+}
+
 static void history_task(void *arg) {
     matrix_history_request_t req = {0};
     if (arg != NULL) {
@@ -2364,6 +2638,16 @@ matrix_message_t *matrix_get_active_history_message(const char *room_id, int ind
     return &s_session->active_history[index];
 }
 
+const char *matrix_get_audio_status(const char *event_id) {
+    if (s_session == NULL || event_id == NULL || event_id[0] == '\0') return NULL;
+    for (int i = 0; i < (int)(sizeof(s_session->audio_status) / sizeof(s_session->audio_status[0])); i++) {
+        if (strcmp(s_session->audio_status[i].event_id, event_id) == 0) {
+            return s_session->audio_status[i].text[0] != '\0' ? s_session->audio_status[i].text : NULL;
+        }
+    }
+    return NULL;
+}
+
 const char *matrix_get_user_id(void) {
     return s_session ? s_session->user_id : "";
 }
@@ -2459,6 +2743,26 @@ esp_err_t matrix_fetch_room_history(int room_index) {
 
     BaseType_t ok = xTaskCreate(history_task, "matrix_history", 12288, req, 4, NULL);
     if (ok != pdPASS) {
+        free(req);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+esp_err_t matrix_request_audio_download(const char *room_id, const char *event_id) {
+    if (s_session == NULL || room_id == NULL || room_id[0] == '\0' || event_id == NULL || event_id[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    matrix_media_request_t *req = heap_caps_calloc(1, sizeof(*req), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (req == NULL) return ESP_ERR_NO_MEM;
+    snprintf(req->room_id, sizeof(req->room_id), "%s", room_id);
+    snprintf(req->event_id, sizeof(req->event_id), "%s", event_id);
+    matrix_set_audio_status(event_id, "queued");
+
+    BaseType_t ok = xTaskCreate(media_download_task, "matrix_media", 12288, req, 4, NULL);
+    if (ok != pdPASS) {
+        matrix_set_audio_status(event_id, "task failed");
         free(req);
         return ESP_ERR_NO_MEM;
     }

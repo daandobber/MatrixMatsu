@@ -17,6 +17,7 @@
 #include "esp_vfs_fat.h"
 #include "freertos/task.h"
 #include "hal/lcd_types.h"
+#include "audio_player.h"
 #include "matrix_client.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -71,6 +72,7 @@ static char      (*g_all_lines)[WRAP_LINE_LEN] = NULL;
 static pax_col_t *g_line_colors                = NULL;
 static pax_col_t *g_line_name_colors           = NULL;
 static uint8_t   *g_line_name_lens             = NULL;
+static int16_t   *g_line_message_indices       = NULL;
 
 typedef enum {
     APP_SCREEN_LOGIN = 0,
@@ -112,6 +114,7 @@ static int  chat_room_index     = -1;
 static char chat_room_id[MATRIX_ROOM_ID_LEN] = "";
 static char compose_buffer[400] = "";
 static int  chat_scroll_offset  = 0;
+static int  chat_selected_message = -1;
 static int  emoji_selected      = 0;
 static int  emoji_scroll        = 0;
 
@@ -120,6 +123,7 @@ static int menu_selected     = 0;
 static int settings_selected = 0;
 static int theme_index       = 0;
 static int font_size_index   = 1;
+static char audio_volume_status[MATRIX_AUDIO_STATUS_LEN] = "";
 
 /* -------------------------------------------------------------------------- */
 /* Forward declarations                                                        */
@@ -2167,6 +2171,7 @@ static bool handle_input_room_list(bsp_input_event_t *event) {
                 chat_room_id[0]    = '\0';
                 compose_buffer[0]  = '\0';
                 chat_scroll_offset = 0;
+                chat_selected_message = -1;
                 matrix_lock();
                 int actual_index = room_visible_to_actual_index_locked(room_selected);
                 chat_room_index = actual_index;
@@ -2270,6 +2275,35 @@ static void render_room_list(void) {
 /* Chat screen                                                                 */
 /* -------------------------------------------------------------------------- */
 
+static int chat_message_count_locked(matrix_room_t *room) {
+    int history_count = matrix_active_history_count(chat_room_id);
+    return history_count > 0 ? history_count : (room != NULL ? room->message_count : 0);
+}
+
+static matrix_message_t *chat_message_at_locked(matrix_room_t *room, int index) {
+    int history_count = matrix_active_history_count(chat_room_id);
+    return history_count > 0 ? matrix_get_active_history_message(chat_room_id, index)
+                             : (room != NULL && index >= 0 && index < room->message_count ? &room->messages[index] : NULL);
+}
+
+static void request_selected_audio(void) {
+    if (chat_room_id[0] == '\0' || chat_selected_message < 0) return;
+
+    char event_id[MATRIX_EVENT_ID_LEN] = "";
+    matrix_lock();
+    int room_index = matrix_find_room_index_by_id(chat_room_id);
+    matrix_room_t *room = matrix_get_room(room_index);
+    matrix_message_t *msg = chat_message_at_locked(room, chat_selected_message);
+    if (msg != NULL && msg->event_id[0] != '\0') {
+        snprintf(event_id, sizeof(event_id), "%s", msg->event_id);
+    }
+    matrix_unlock();
+
+    if (event_id[0] != '\0') {
+        matrix_request_audio_download(chat_room_id, event_id);
+    }
+}
+
 static void send_current_message(void) {
     if (chat_room_id[0] == '\0' || compose_buffer[0] == '\0') return;
 
@@ -2287,6 +2321,7 @@ static void send_current_message(void) {
     matrix_send_message(room_index, compose_buffer);
     compose_buffer[0]  = '\0';
     chat_scroll_offset = 0;
+    chat_selected_message = -1;
 }
 
 static bool handle_input_chat(bsp_input_event_t *event) {
@@ -2300,22 +2335,63 @@ static bool handle_input_chat(bsp_input_event_t *event) {
                 render_chat_input_only();
                 return false;
             }
-            case BSP_INPUT_NAVIGATION_KEY_UP:
-                if (chat_scroll_offset < 1000) chat_scroll_offset++;
+            case BSP_INPUT_NAVIGATION_KEY_UP: {
+                matrix_lock();
+                int room_index = matrix_find_room_index_by_id(chat_room_id);
+                matrix_room_t *room = matrix_get_room(room_index);
+                int count = chat_message_count_locked(room);
+                if (count > 0) {
+                    if (chat_selected_message < 0 || chat_selected_message >= count) chat_selected_message = count - 1;
+                    else if (chat_selected_message > 0) chat_selected_message--;
+                }
+                matrix_unlock();
                 return true;
-            case BSP_INPUT_NAVIGATION_KEY_DOWN:
-                if (chat_scroll_offset > 0) chat_scroll_offset--;
+            }
+            case BSP_INPUT_NAVIGATION_KEY_DOWN: {
+                matrix_lock();
+                int room_index = matrix_find_room_index_by_id(chat_room_id);
+                matrix_room_t *room = matrix_get_room(room_index);
+                int count = chat_message_count_locked(room);
+                if (count > 0) {
+                    if (chat_selected_message < 0 || chat_selected_message >= count) chat_selected_message = count - 1;
+                    else if (chat_selected_message < count - 1) chat_selected_message++;
+                }
+                matrix_unlock();
                 return true;
+            }
             case BSP_INPUT_NAVIGATION_KEY_PGUP:
-                chat_scroll_offset += 5;
-                if (chat_scroll_offset > 1000) chat_scroll_offset = 1000;
+                matrix_lock();
+                {
+                    int room_index = matrix_find_room_index_by_id(chat_room_id);
+                    matrix_room_t *room = matrix_get_room(room_index);
+                    int count = chat_message_count_locked(room);
+                    if (count > 0) {
+                        if (chat_selected_message < 0 || chat_selected_message >= count) chat_selected_message = count - 1;
+                        chat_selected_message -= 5;
+                        if (chat_selected_message < 0) chat_selected_message = 0;
+                    }
+                }
+                matrix_unlock();
                 return true;
             case BSP_INPUT_NAVIGATION_KEY_PGDN:
-                chat_scroll_offset -= 5;
-                if (chat_scroll_offset < 0) chat_scroll_offset = 0;
+                matrix_lock();
+                {
+                    int room_index = matrix_find_room_index_by_id(chat_room_id);
+                    matrix_room_t *room = matrix_get_room(room_index);
+                    int count = chat_message_count_locked(room);
+                    if (count > 0) {
+                        if (chat_selected_message < 0 || chat_selected_message >= count) chat_selected_message = count - 1;
+                        else {
+                            chat_selected_message += 5;
+                            if (chat_selected_message >= count) chat_selected_message = count - 1;
+                        }
+                    }
+                }
+                matrix_unlock();
                 return true;
             case BSP_INPUT_NAVIGATION_KEY_RETURN:
-                send_current_message();
+                if (compose_buffer[0] != '\0') send_current_message();
+                else request_selected_audio();
                 return true;
             default:
                 return false;
@@ -2328,7 +2404,8 @@ static bool handle_input_chat(bsp_input_event_t *event) {
             return false;
         }
         if (ascii == '\r' || ascii == '\n') {
-            send_current_message();
+            if (compose_buffer[0] != '\0') send_current_message();
+            else request_selected_audio();
             return true;
         }
         if ((unsigned char)ascii >= 0x20 || (event->args_keyboard.utf8 != NULL && event->args_keyboard.utf8[0] != '\0')) {
@@ -2357,6 +2434,8 @@ static void render_chat_frame(bool do_blit) {
     char title[192]     = "";
     bool room_encrypted = false;
     int  total_lines    = 0;
+    int  selected_line_start = -1;
+    int  selected_line_end   = -1;
 
     matrix_lock();
     int room_index = matrix_find_room_index_by_id(chat_room_id);
@@ -2373,9 +2452,13 @@ static void render_chat_frame(bool do_blit) {
         (room->has_name && room->name[0] != '\0') ? room->name : room->room_id
     );
 
-    if (g_all_lines != NULL && g_line_colors != NULL && g_line_name_colors != NULL && g_line_name_lens != NULL) {
+    if (g_all_lines != NULL && g_line_colors != NULL && g_line_name_colors != NULL && g_line_name_lens != NULL &&
+        g_line_message_indices != NULL) {
         int history_count = matrix_active_history_count(chat_room_id);
         int message_count = history_count > 0 ? history_count : room->message_count;
+        if (message_count > 0 && (chat_selected_message < 0 || chat_selected_message >= message_count)) {
+            chat_selected_message = message_count - 1;
+        }
         for (int i = 0; i < message_count && total_lines < MAX_WRAP_LINES_TOTAL - 8; i++) {
             matrix_message_t *msg = history_count > 0 ? matrix_get_active_history_message(chat_room_id, i)
                                                       : &room->messages[i];
@@ -2385,6 +2468,12 @@ static void render_chat_frame(bool do_blit) {
             char               body_with_reactions[MATRIX_BODY_LEN + 96];
             char               display_body[MATRIX_BODY_LEN + 160];
             snprintf(body_with_reactions, sizeof(body_with_reactions), "%s", msg->body);
+            const char *audio_status = matrix_get_audio_status(msg->event_id);
+            if (audio_status != NULL && audio_status[0] != '\0') {
+                char suffix[MATRIX_AUDIO_STATUS_LEN + 8];
+                snprintf(suffix, sizeof(suffix), "  [%s]", audio_status);
+                strncat(body_with_reactions, suffix, sizeof(body_with_reactions) - strlen(body_with_reactions) - 1);
+            }
             for (int r = 0; r < MATRIX_MAX_REACTIONS; r++) {
                 if (msg->reactions[r].key[0] == '\0' || msg->reactions[r].count == 0) continue;
                 char reaction[40];
@@ -2406,6 +2495,7 @@ static void render_chat_frame(bool do_blit) {
             pax_col_t color = msg->is_notice ? TERM_DIM : (mine ? TERM_CYAN : TERM_FG);
             pax_col_t name_color = sender_name_color(msg->sender, mine, msg->is_notice);
             size_t    prefix_len = strlen(prefix);
+            int       first_line = total_lines;
 
             for (int j = 0; j < n && total_lines < MAX_WRAP_LINES_TOTAL; j++) {
                 strncpy(g_all_lines[total_lines], wrapped[j], WRAP_LINE_LEN - 1);
@@ -2413,7 +2503,12 @@ static void render_chat_frame(bool do_blit) {
                 g_line_colors[total_lines] = color;
                 g_line_name_colors[total_lines] = name_color;
                 g_line_name_lens[total_lines] = (j == 0 && prefix_len < strlen(wrapped[j])) ? (uint8_t)prefix_len : 0;
+                g_line_message_indices[total_lines] = (int16_t)i;
                 total_lines++;
+            }
+            if (i == chat_selected_message && first_line < total_lines) {
+                selected_line_start = first_line;
+                selected_line_end   = total_lines - 1;
             }
         }
     }
@@ -2422,6 +2517,16 @@ static void render_chat_frame(bool do_blit) {
     int visible_rows = (int)((messages_h - g_line_h * 1.25f) / g_line_h);
     if (visible_rows < 1) visible_rows = 1;
     int max_scroll = (total_lines > visible_rows) ? (total_lines - visible_rows) : 0;
+    if (selected_line_start >= 0 && selected_line_end >= 0) {
+        int visible_start = total_lines - chat_scroll_offset - visible_rows;
+        int visible_end   = total_lines - chat_scroll_offset - 1;
+        if (visible_start < 0) visible_start = 0;
+        if (selected_line_start < visible_start) {
+            chat_scroll_offset = total_lines - visible_rows - selected_line_start;
+        } else if (selected_line_end > visible_end) {
+            chat_scroll_offset = total_lines - selected_line_end - 1;
+        }
+    }
     if (chat_scroll_offset > max_scroll) chat_scroll_offset = max_scroll;
     if (chat_scroll_offset < 0) chat_scroll_offset = 0;
 
@@ -2433,9 +2538,15 @@ static void render_chat_frame(bool do_blit) {
         draw_matrix_status(16, 12 + g_line_h);
     }
     draw_box(16, messages_y, w - 32, messages_h, TERM_GREEN, title);
-    if (g_all_lines != NULL && g_line_colors != NULL && g_line_name_colors != NULL && g_line_name_lens != NULL) {
+    if (g_all_lines != NULL && g_line_colors != NULL && g_line_name_colors != NULL && g_line_name_lens != NULL &&
+        g_line_message_indices != NULL) {
         float ty = messages_y + g_line_h;
         for (int i = start_line; i < end_line; i++) {
+            bool selected = chat_selected_message >= 0 && g_line_message_indices[i] == chat_selected_message;
+            if (selected) {
+                pax_simple_rect(&fb, TERM_SELECT_BG, 24, ty - 2, w - 48, g_line_h);
+                pax_outline_rect(&fb, TERM_GREEN, 24, ty - 2, w - 48, g_line_h);
+            }
             if (g_line_name_lens[i] > 0) {
                 char prefix[WRAP_LINE_LEN];
                 size_t prefix_len = g_line_name_lens[i];
@@ -2758,6 +2869,22 @@ static void render_settings(void) {
 static bool handle_global_hotkeys(bsp_input_event_t *event) {
     if (event->type != INPUT_EVENT_TYPE_NAVIGATION || !event->args_navigation.state) return false;
     switch (event->args_navigation.key) {
+        case BSP_INPUT_NAVIGATION_KEY_VOLUME_UP: {
+            int vol = audio_player_get_volume_percent();
+            vol += 5;
+            if (vol > 100) vol = 100;
+            audio_player_set_volume_percent(vol);
+            snprintf(audio_volume_status, sizeof(audio_volume_status), "volume %d", vol);
+            return true;
+        }
+        case BSP_INPUT_NAVIGATION_KEY_VOLUME_DOWN: {
+            int vol = audio_player_get_volume_percent();
+            vol -= 5;
+            if (vol < 0) vol = 0;
+            audio_player_set_volume_percent(vol);
+            snprintf(audio_volume_status, sizeof(audio_volume_status), "volume %d", vol);
+            return true;
+        }
         case BSP_INPUT_NAVIGATION_KEY_ESC:
             if (screen == APP_SCREEN_EMOJI_PICKER) {
                 return false;
@@ -2909,7 +3036,9 @@ void app_main(void) {
     g_line_colors = heap_caps_calloc(MAX_WRAP_LINES_TOTAL, sizeof(*g_line_colors), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     g_line_name_colors = heap_caps_calloc(MAX_WRAP_LINES_TOTAL, sizeof(*g_line_name_colors), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     g_line_name_lens   = heap_caps_calloc(MAX_WRAP_LINES_TOTAL, sizeof(*g_line_name_lens), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (g_all_lines == NULL || g_line_colors == NULL || g_line_name_colors == NULL || g_line_name_lens == NULL) {
+    g_line_message_indices = heap_caps_calloc(MAX_WRAP_LINES_TOTAL, sizeof(*g_line_message_indices), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (g_all_lines == NULL || g_line_colors == NULL || g_line_name_colors == NULL || g_line_name_lens == NULL ||
+        g_line_message_indices == NULL) {
         ESP_LOGE(TAG, "Failed to allocate chat render buffers");
     }
 

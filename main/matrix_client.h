@@ -26,6 +26,7 @@ extern "C" {
 #define MATRIX_MAX_MEMBERS     6
 #define MATRIX_MAX_REACTIONS   4
 #define MATRIX_REACTION_KEY_LEN 24
+#define MATRIX_AUDIO_STATUS_LEN 48
 
 typedef struct {
     char    key[MATRIX_REACTION_KEY_LEN];
@@ -121,6 +122,7 @@ matrix_room_t *matrix_get_room(int index);
 int            matrix_find_room_index_by_id(const char *room_id);
 int            matrix_active_history_count(const char *room_id);
 matrix_message_t *matrix_get_active_history_message(const char *room_id, int index);
+const char       *matrix_get_audio_status(const char *event_id);
 
 const char *matrix_get_user_id(void);
 const char *matrix_get_last_error(void);
@@ -129,6 +131,7 @@ void        matrix_get_sync_stats(matrix_sync_stats_t *out_stats);
 // Queues a message to be sent asynchronously from the sender task.
 esp_err_t matrix_send_message(int room_index, const char *body);
 esp_err_t matrix_fetch_room_history(int room_index);
+esp_err_t matrix_request_audio_download(const char *room_id, const char *event_id);
 
 #ifdef __cplusplus
 }

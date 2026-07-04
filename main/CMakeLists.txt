@@ -6,6 +6,7 @@ endif()
 
 idf_component_register(
 	SRCS
+		"audio_player_decode.cpp"
 		"main.c"
 		"matrix_client.c"
 	PRIV_REQUIRES
@@ -15,7 +16,9 @@ idf_component_register(
 		bt
 		badge-bsp
 		tanmatsu-wifi
+		micro-opus
 		esp_http_client
+		esp_driver_i2s
 		esp-tls
 		mbedtls
 		json
