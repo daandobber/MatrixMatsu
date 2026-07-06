@@ -7,6 +7,7 @@ sdkconfig.old
 *.bak
 *.old
 tools/__pycache__
+__pycache__/
 .cache
 esp-idf
 esp-idf-tools

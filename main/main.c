@@ -20,6 +20,7 @@
 #include "audio_player.h"
 #include "image_viewer.h"
 #include "matrix_client.h"
+#include "video_player.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "pax_fonts.h"
@@ -80,6 +81,7 @@ typedef enum {
     APP_SCREEN_ROOM_LIST,
     APP_SCREEN_CHAT,
     APP_SCREEN_IMAGE_VIEWER,
+    APP_SCREEN_VIDEO_PLAYER,
     APP_SCREEN_EMOJI_PICKER,
     APP_SCREEN_MENU,
     APP_SCREEN_SETTINGS,
@@ -126,6 +128,8 @@ static char viewed_image_error[96] = "";
 static char pending_image_event_id[MATRIX_EVENT_ID_LEN] = "";
 static volatile bool image_decode_busy = false;
 static volatile bool image_decode_ready = false;
+static char active_video_event_id[MATRIX_EVENT_ID_LEN] = "";
+static bool video_screen_cleared = false;
 
 typedef struct {
     uint8_t *data;
@@ -166,6 +170,7 @@ static bool handle_input_login(bsp_input_event_t *event);
 static bool handle_input_room_list(bsp_input_event_t *event);
 static bool handle_input_chat(bsp_input_event_t *event);
 static bool handle_input_image_viewer(bsp_input_event_t *event);
+static bool handle_input_video_player(bsp_input_event_t *event);
 static bool handle_input_emoji_picker(bsp_input_event_t *event);
 static bool handle_input_menu(bsp_input_event_t *event);
 static bool handle_input_settings(bsp_input_event_t *event);
@@ -178,6 +183,7 @@ static void render_chat_frame(bool do_blit);
 static void render_chat(void);
 static void render_chat_input_only(void);
 static void render_image_viewer(void);
+static void render_video_player(void);
 static void render_emoji_picker(void);
 static void render_menu(void);
 static void render_settings(void);
@@ -2416,6 +2422,34 @@ static void maybe_open_pending_image(void) {
     }
 }
 
+/* Video playback runs synchronously inside matrix_client's background download
+ * task (see media_download_task), blitting frames straight to the display. The
+ * UI only needs to know when to get out of the way (switch screens) and when
+ * to come back, which it learns by polling the same audio_status text used for
+ * images/audio. */
+static void maybe_start_pending_video(void) {
+    if (screen != APP_SCREEN_CHAT || pending_image_event_id[0] == '\0') return;
+    const char *status = matrix_get_audio_status(pending_image_event_id);
+    if (status == NULL) return;
+    if (strcmp(status, "video: playing") == 0) {
+        snprintf(active_video_event_id, sizeof(active_video_event_id), "%s", pending_image_event_id);
+        pending_image_event_id[0] = '\0';
+        video_screen_cleared = false;
+        screen = APP_SCREEN_VIDEO_PLAYER;
+    } else if (strcmp(status, "not media") == 0 || strstr(status, "failed") != NULL) {
+        pending_image_event_id[0] = '\0';
+    }
+}
+
+static void maybe_finish_active_video(void) {
+    if (screen != APP_SCREEN_VIDEO_PLAYER || active_video_event_id[0] == '\0') return;
+    const char *status = matrix_get_audio_status(active_video_event_id);
+    if (status != NULL && strcmp(status, "video: playing") != 0) {
+        active_video_event_id[0] = '\0';
+        screen = APP_SCREEN_CHAT;
+    }
+}
+
 static void send_current_message(void) {
     if (chat_room_id[0] == '\0' || compose_buffer[0] == '\0') return;
 
@@ -3000,6 +3034,28 @@ static bool handle_input_image_viewer(bsp_input_event_t *event) {
     return false;
 }
 
+static bool handle_input_video_player(bsp_input_event_t *event) {
+    bool cancel = false;
+    if (event->type == INPUT_EVENT_TYPE_NAVIGATION && event->args_navigation.state) {
+        switch (event->args_navigation.key) {
+            case BSP_INPUT_NAVIGATION_KEY_ESC:
+            case BSP_INPUT_NAVIGATION_KEY_RETURN:
+            case BSP_INPUT_NAVIGATION_KEY_BACKSPACE:
+                cancel = true;
+                break;
+            default: break;
+        }
+    } else if (event->type == INPUT_EVENT_TYPE_KEYBOARD) {
+        char ascii = event->args_keyboard.ascii;
+        if (ascii == '\r' || ascii == '\n' || ascii == '\b') cancel = true;
+    }
+    if (!cancel) return false;
+    video_player_request_stop();
+    active_video_event_id[0] = '\0';
+    screen = APP_SCREEN_CHAT;
+    return true;
+}
+
 static void render_image_viewer(void) {
     pax_background(&fb, BLACK);
     float w = pax_buf_get_widthf(&fb);
@@ -3032,6 +3088,18 @@ static void render_image_viewer(void) {
     blit();
 }
 
+/* Frames are blitted directly to the display by the background task that
+ * decodes them (see video_player_play_buffer), bypassing the pax framebuffer
+ * entirely. This only clears the screen once, right before playback starts;
+ * after that it must not touch the display, or it would wipe out frames the
+ * background task just drew. */
+static void render_video_player(void) {
+    if (video_screen_cleared) return;
+    pax_background(&fb, BLACK);
+    blit();
+    video_screen_cleared = true;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Dispatch                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -3057,6 +3125,9 @@ static bool handle_global_hotkeys(bsp_input_event_t *event) {
         }
         case BSP_INPUT_NAVIGATION_KEY_ESC:
             if (screen == APP_SCREEN_IMAGE_VIEWER) {
+                return false;
+            }
+            if (screen == APP_SCREEN_VIDEO_PLAYER) {
                 return false;
             }
             if (screen == APP_SCREEN_EMOJI_PICKER) {
@@ -3104,6 +3175,7 @@ static void render(void) {
         case APP_SCREEN_ROOM_LIST: render_room_list(); break;
         case APP_SCREEN_CHAT: render_chat(); break;
         case APP_SCREEN_IMAGE_VIEWER: render_image_viewer(); break;
+        case APP_SCREEN_VIDEO_PLAYER: render_video_player(); break;
         case APP_SCREEN_EMOJI_PICKER: render_emoji_picker(); break;
         case APP_SCREEN_MENU: render_menu(); break;
         case APP_SCREEN_SETTINGS: render_settings(); break;
@@ -3233,6 +3305,7 @@ void app_main(void) {
                     case APP_SCREEN_ROOM_LIST: need_redraw = handle_input_room_list(&event); break;
                     case APP_SCREEN_CHAT: need_redraw = handle_input_chat(&event); break;
                     case APP_SCREEN_IMAGE_VIEWER: need_redraw = handle_input_image_viewer(&event); break;
+                    case APP_SCREEN_VIDEO_PLAYER: need_redraw = handle_input_video_player(&event); break;
                     case APP_SCREEN_EMOJI_PICKER: need_redraw = handle_input_emoji_picker(&event); break;
                     case APP_SCREEN_MENU: need_redraw = handle_input_menu(&event); break;
                     case APP_SCREEN_SETTINGS: need_redraw = handle_input_settings(&event); break;
@@ -3247,6 +3320,8 @@ void app_main(void) {
 
         if (matrix_consume_dirty()) {
             maybe_open_pending_image();
+            maybe_start_pending_video();
+            maybe_finish_active_video();
             need_redraw = true;
         }
 

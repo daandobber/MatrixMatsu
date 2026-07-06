@@ -1,0 +1,15 @@
+[Unit]
+Description=MatrixMatsu media transcoding proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/media-proxy
+ExecStart=/opt/media-proxy/.venv/bin/python /opt/media-proxy/proxy.py https://jouw-homeserver.example.org --port 8008 --cache-dir /opt/media-proxy/cache
+Restart=on-failure
+RestartSec=5
+User=media-proxy
+Group=media-proxy
+
+[Install]
+WantedBy=multi-user.target

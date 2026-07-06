@@ -6,10 +6,13 @@ endif()
 
 idf_component_register(
 	SRCS
+		"audio_output.cpp"
 		"audio_player_decode.cpp"
 		"image_viewer.c"
 		"main.c"
 		"matrix_client.c"
+		"video_player.cpp"
+		"openh264_probe.cpp"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
@@ -27,9 +30,12 @@ idf_component_register(
 		mbedtls
 		json
 		esp_timer
+		openh264_dec
 		${extra_requires}
 	INCLUDE_DIRS
 		"."
+	EMBED_FILES
+		"test_assets/openh264_probe_clip.264"
 )
 
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=unused-variable" APPEND)

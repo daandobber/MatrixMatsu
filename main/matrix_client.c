@@ -22,6 +22,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
+#include "video_player.h"
 
 static const char *TAG = "matrix";
 
@@ -2347,10 +2348,11 @@ static void media_download_task(void *arg) {
 
     bool is_audio = cJSON_IsString(msgtype) && strcmp(msgtype->valuestring, "m.audio") == 0;
     bool is_image = cJSON_IsString(msgtype) && strcmp(msgtype->valuestring, "m.image") == 0;
-    if ((!is_audio && !is_image) || !cJSON_IsString(mxc) || strncmp(mxc->valuestring, "mxc://", 6) != 0) {
+    bool is_video = cJSON_IsString(msgtype) && strcmp(msgtype->valuestring, "m.video") == 0;
+    if ((!is_audio && !is_image && !is_video) || !cJSON_IsString(mxc) || strncmp(mxc->valuestring, "mxc://", 6) != 0) {
         cJSON_Delete(root);
         matrix_set_audio_status(req.event_id, "not media");
-        matrix_set_last_error("media: not audio/image");
+        matrix_set_last_error("media: not audio/image/video");
         vTaskDelete(NULL);
         return;
     }
@@ -2364,9 +2366,10 @@ static void media_download_task(void *arg) {
         return;
     }
 
-    const char *mimetype = cJSON_IsString(mime) ? mime->valuestring : (is_image ? "image/jpeg" : "audio/ogg");
-    const char *label = cJSON_IsString(body) ? body->valuestring : (is_image ? "image" : "audio");
-    size_t max_bytes = is_image ? (4 * 1024 * 1024) : (2 * 1024 * 1024);
+    const char *mimetype =
+        cJSON_IsString(mime) ? mime->valuestring : (is_image ? "image/jpeg" : (is_video ? "video/mp4" : "audio/ogg"));
+    const char *label = cJSON_IsString(body) ? body->valuestring : (is_image ? "image" : (is_video ? "video" : "audio"));
+    size_t max_bytes = is_image ? (4 * 1024 * 1024) : (is_video ? (24 * 1024 * 1024) : (2 * 1024 * 1024));
     if (cJSON_IsNumber(size) && size->valuedouble > 0 && size->valuedouble < (double)max_bytes) {
         max_bytes = (size_t)size->valuedouble + 4096;
     }
@@ -2399,6 +2402,17 @@ static void media_download_task(void *arg) {
                 matrix_set_last_error(audio_player_last_error());
             } else {
                 matrix_set_audio_status(req.event_id, "played");
+            }
+            heap_caps_free(media_data);
+            media_data = NULL;
+        } else if (is_video) {
+            matrix_set_audio_status(req.event_id, "video: playing");
+            res = video_player_play_buffer(media_data, media_len, label);
+            if (res != ESP_OK) {
+                matrix_set_audio_status(req.event_id, video_player_last_error());
+                matrix_set_last_error(video_player_last_error());
+            } else {
+                matrix_set_audio_status(req.event_id, "video: done");
             }
             heap_caps_free(media_data);
             media_data = NULL;
@@ -2898,7 +2912,10 @@ esp_err_t matrix_request_media_download(const char *room_id, const char *event_i
     snprintf(req->event_id, sizeof(req->event_id), "%s", event_id);
     matrix_set_audio_status(event_id, "queued");
 
-    BaseType_t ok = xTaskCreate(media_download_task, "matrix_media", 12288, req, 4, NULL);
+    /* 48KB: OpenH264's decode call chain needs a lot more stack than the old
+     * tinyh264 decoder did (confirmed via a standalone probe needing well
+     * under 64KB but comfortably over the previous 12KB here). */
+    BaseType_t ok = xTaskCreate(media_download_task, "matrix_media", 49152, req, 4, NULL);
     if (ok != pdPASS) {
         matrix_set_audio_status(event_id, "task failed");
         free(req);

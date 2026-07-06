@@ -5,12 +5,7 @@
 #include <cstdio>
 #include <cstring>
 
-extern "C" {
-#include "bsp/audio.h"
-esp_err_t bsp_audio_initialize(void);
-}
-#include "driver/i2s_common.h"
-#include "driver/i2s_std.h"
+#include "audio_output.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -20,15 +15,10 @@ esp_err_t bsp_audio_initialize(void);
 
 static const char *TAG = "audio_decode";
 static char s_last_error[96] = "";
-static bool s_audio_initialized = false;
-static int s_volume_percent = 55;
 static audio_player_progress_cb_t s_progress_cb = nullptr;
 static void *s_progress_ctx = nullptr;
 static constexpr int kPcmGainNumerator = 1;
 static constexpr int kPcmGainDenominator = 2;
-static constexpr size_t kI2sWriteChunkBytes = 2048;
-static constexpr int kI2sTimeoutRetries = 40;
-static constexpr int kSilenceDrainMs = 120;
 
 static void set_last_error(const char *fmt, ...) {
     va_list args;
@@ -42,17 +32,11 @@ const char *audio_player_last_error(void) {
 }
 
 void audio_player_set_volume_percent(int percent) {
-    if (percent < 0) percent = 0;
-    if (percent > 100) percent = 100;
-    s_volume_percent = percent;
-    if (s_audio_initialized) {
-        esp_err_t res = bsp_audio_set_volume((float)s_volume_percent);
-        if (res != ESP_OK) ESP_LOGW(TAG, "Volume set failed: %s", esp_err_to_name(res));
-    }
+    audio_output_set_volume_percent(percent);
 }
 
 int audio_player_get_volume_percent(void) {
-    return s_volume_percent;
+    return audio_output_get_volume_percent();
 }
 
 void audio_player_set_progress_callback(audio_player_progress_cb_t cb, void *ctx) {
@@ -96,125 +80,6 @@ static const char *vorbis_result_name(micro_vorbis::OggVorbisResult result) {
         default: return "vorbis";
     }
 }
-
-class BspI2sWriter {
-public:
-    esp_err_t begin(uint32_t sample_rate) {
-        esp_err_t res = bsp_audio_get_i2s_handle(&this->i2s_);
-        if ((res != ESP_OK || this->i2s_ == nullptr) && !s_audio_initialized) {
-            res = bsp_audio_initialize();
-            if (res != ESP_OK) {
-                set_last_error("audio init %s", esp_err_to_name(res));
-                return res;
-            }
-            s_audio_initialized = true;
-            res = bsp_audio_get_i2s_handle(&this->i2s_);
-        } else if (res == ESP_OK && this->i2s_ != nullptr) {
-            s_audio_initialized = true;
-        }
-
-        if (res != ESP_OK || this->i2s_ == nullptr) {
-            set_last_error("i2s handle %s", esp_err_to_name(res));
-            return res == ESP_OK ? ESP_FAIL : res;
-        }
-
-        esp_err_t disable_res = i2s_channel_disable(this->i2s_);
-        if (disable_res != ESP_OK && disable_res != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "I2S disable before rate change failed: %s", esp_err_to_name(disable_res));
-        }
-
-        res = bsp_audio_set_rate(sample_rate);
-        if (res != ESP_OK) {
-            set_last_error("rate %s", esp_err_to_name(res));
-            return res;
-        }
-
-        res = i2s_channel_enable(this->i2s_);
-        if (res != ESP_OK && res != ESP_ERR_INVALID_STATE) {
-            set_last_error("i2s enable %s", esp_err_to_name(res));
-            return res;
-        }
-
-        esp_err_t vol_res = bsp_audio_set_volume((float)s_volume_percent);
-        if (vol_res != ESP_OK) ESP_LOGW(TAG, "Volume set failed: %s", esp_err_to_name(vol_res));
-        esp_err_t amp_res = bsp_audio_set_amplifier(true);
-        if (amp_res != ESP_OK) ESP_LOGW(TAG, "Amplifier enable failed: %s", esp_err_to_name(amp_res));
-
-        this->ready_ = true;
-        return ESP_OK;
-    }
-
-    esp_err_t write(const int16_t *pcm, size_t samples_per_channel, uint8_t channels) {
-        if (!this->ready_ || this->i2s_ == nullptr || pcm == nullptr || samples_per_channel == 0) {
-            return ESP_ERR_INVALID_STATE;
-        }
-        if (channels != 2) {
-            set_last_error("pcm ch %u", (unsigned int)channels);
-            return ESP_ERR_NOT_SUPPORTED;
-        }
-
-        const uint8_t *data = reinterpret_cast<const uint8_t *>(pcm);
-        size_t length = samples_per_channel * channels * sizeof(int16_t);
-        size_t total_written = 0;
-        while (total_written < length) {
-            size_t written = 0;
-            size_t to_write = length - total_written;
-            if (to_write > kI2sWriteChunkBytes) to_write = kI2sWriteChunkBytes;
-
-            esp_err_t res = ESP_OK;
-            for (int attempt = 0; attempt <= kI2sTimeoutRetries; attempt++) {
-                written = 0;
-                res = i2s_channel_write(this->i2s_, data + total_written, to_write, &written, pdMS_TO_TICKS(250));
-                if (res != ESP_ERR_TIMEOUT && !(res == ESP_OK && written == 0)) break;
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
-
-            if (res != ESP_OK || written == 0) {
-                if (res == ESP_OK) {
-                    set_last_error("i2s no progress");
-                } else {
-                    set_last_error("i2s write %s", esp_err_to_name(res));
-                }
-                return res == ESP_OK ? ESP_FAIL : res;
-            }
-            total_written += written;
-            this->bytes_written_ += written;
-        }
-        return ESP_OK;
-    }
-
-    size_t bytes_written() const {
-        return this->bytes_written_;
-    }
-
-    void finish() {
-        if (!this->ready_ || this->i2s_ == nullptr) {
-            bsp_audio_set_amplifier(false);
-            return;
-        }
-
-        int16_t silence[480 * 2] = {0};
-        const int blocks = kSilenceDrainMs / 10;
-        for (int i = 0; i < blocks; i++) {
-            if (this->write(silence, 480, 2) != ESP_OK) break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(40));
-
-        esp_err_t amp_res = bsp_audio_set_amplifier(false);
-        if (amp_res != ESP_OK) ESP_LOGW(TAG, "Amplifier disable failed: %s", esp_err_to_name(amp_res));
-
-        esp_err_t disable_res = i2s_channel_disable(this->i2s_);
-        if (disable_res != ESP_OK && disable_res != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "I2S disable after playback failed: %s", esp_err_to_name(disable_res));
-        }
-        this->ready_ = false;
-    }
-
-private:
-    i2s_chan_handle_t i2s_ = nullptr;
-    bool ready_ = false;
-    size_t bytes_written_ = 0;
-};
 
 static void apply_pcm_gain(int16_t *pcm, size_t samples_per_channel, uint8_t channels) {
     if (pcm == nullptr || samples_per_channel == 0 || channels == 0) return;
@@ -285,13 +150,19 @@ static esp_err_t play_ogg_opus_buffer(const uint8_t *data, size_t data_len) {
             if (!writer_started) {
                 active_rate = decoder.get_sample_rate() != 0 ? decoder.get_sample_rate() : sample_rate;
                 result = writer.begin(active_rate);
-                if (result != ESP_OK) break;
+                if (result != ESP_OK) {
+                    set_last_error("i2s %s", writer.last_error());
+                    break;
+                }
                 writer_started = true;
             }
             uint8_t out_channels = decoder.get_channels() != 0 ? decoder.get_channels() : channels;
             apply_pcm_gain(pcm, samples_decoded, out_channels);
             result = writer.write(pcm, samples_decoded, out_channels);
-            if (result != ESP_OK) break;
+            if (result != ESP_OK) {
+                set_last_error("i2s %s", writer.last_error());
+                break;
+            }
             total_samples += samples_decoded;
             report_progress(&last_reported_sec, total_samples, active_rate);
             frames++;
@@ -387,13 +258,19 @@ static esp_err_t play_ogg_vorbis_buffer(const uint8_t *data, size_t data_len) {
                 uint32_t rate = decoder.get_pcm_format().sample_rate();
                 active_rate = rate != 0 ? rate : 48000;
                 result = writer.begin(active_rate);
-                if (result != ESP_OK) break;
+                if (result != ESP_OK) {
+                    set_last_error("i2s %s", writer.last_error());
+                    break;
+                }
                 writer_started = true;
             }
             int16_t *pcm16 = reinterpret_cast<int16_t *>(pcm);
             apply_pcm_gain(pcm16, samples_per_channel, (uint8_t)out_channels);
             result = writer.write(pcm16, samples_per_channel, (uint8_t)out_channels);
-            if (result != ESP_OK) break;
+            if (result != ESP_OK) {
+                set_last_error("i2s %s", writer.last_error());
+                break;
+            }
             total_samples += samples_per_channel;
             report_progress(&last_reported_sec, total_samples, active_rate);
             frames++;
