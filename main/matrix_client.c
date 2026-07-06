@@ -666,10 +666,12 @@ static bool matrix_url_encode(const char *in, char *out, size_t out_len) {
     return in[i] == '\0';
 }
 
-static bool matrix_mxc_to_download_url(const char *homeserver, const char *mxc, char *out, size_t out_len) {
-    if (homeserver == NULL || homeserver[0] == '\0' || mxc == NULL || strncmp(mxc, "mxc://", 6) != 0) {
-        return false;
-    }
+#define MATRIX_IMAGE_THUMBNAIL_DIM 720
+
+static bool matrix_mxc_encode_parts(
+    const char *mxc, char *server_enc, size_t server_enc_len, char *media_enc, size_t media_enc_len
+) {
+    if (mxc == NULL || strncmp(mxc, "mxc://", 6) != 0) return false;
     const char *server = mxc + 6;
     const char *slash  = strchr(server, '/');
     if (slash == NULL || slash == server || slash[1] == '\0') return false;
@@ -682,15 +684,33 @@ static bool matrix_mxc_to_download_url(const char *homeserver, const char *mxc, 
     server_raw[server_len] = '\0';
     snprintf(media_raw, sizeof(media_raw), "%s", slash + 1);
 
-    char server_enc[sizeof(server_raw) * 3];
-    char media_enc[sizeof(media_raw) * 3];
-    if (!matrix_url_encode(server_raw, server_enc, sizeof(server_enc)) ||
-        !matrix_url_encode(media_raw, media_enc, sizeof(media_enc))) {
-        return false;
-    }
+    return matrix_url_encode(server_raw, server_enc, server_enc_len) &&
+           matrix_url_encode(media_raw, media_enc, media_enc_len);
+}
+
+static bool matrix_mxc_to_download_url(const char *homeserver, const char *mxc, char *out, size_t out_len) {
+    if (homeserver == NULL || homeserver[0] == '\0') return false;
+    char server_enc[96 * 3];
+    char media_enc[160 * 3];
+    if (!matrix_mxc_encode_parts(mxc, server_enc, sizeof(server_enc), media_enc, sizeof(media_enc))) return false;
 
     int len = snprintf(
         out, out_len, "%s/_matrix/client/v1/media/download/%s/%s", homeserver, server_enc, media_enc
+    );
+    return len > 0 && len < (int)out_len;
+}
+
+/* Server-generated thumbnails are re-encoded (baseline JPEG/PNG), which sidesteps
+ * progressive JPEGs that neither the hardware nor tjpgd software decoder can read. */
+static bool matrix_mxc_to_thumbnail_url(const char *homeserver, const char *mxc, char *out, size_t out_len) {
+    if (homeserver == NULL || homeserver[0] == '\0') return false;
+    char server_enc[96 * 3];
+    char media_enc[160 * 3];
+    if (!matrix_mxc_encode_parts(mxc, server_enc, sizeof(server_enc), media_enc, sizeof(media_enc))) return false;
+
+    int len = snprintf(
+        out, out_len, "%s/_matrix/client/v1/media/thumbnail/%s/%s?width=%u&height=%u&method=scale",
+        homeserver, server_enc, media_enc, MATRIX_IMAGE_THUMBNAIL_DIM, MATRIX_IMAGE_THUMBNAIL_DIM
     );
     return len > 0 && len < (int)out_len;
 }
@@ -2238,6 +2258,28 @@ static void process_joined_members_body(const char *room_id, const char *body) {
     cJSON_Delete(root);
 }
 
+typedef struct {
+    char event_id[MATRIX_EVENT_ID_LEN];
+    uint32_t duration_ms;
+} audio_progress_ctx_t;
+
+static void format_audio_progress(char *out, size_t out_len, uint32_t elapsed_ms, uint32_t duration_ms) {
+    unsigned int es = (unsigned int)(elapsed_ms / 1000);
+    if (duration_ms > 0) {
+        unsigned int ds = (unsigned int)(duration_ms / 1000);
+        snprintf(out, out_len, "%u:%02u / %u:%02u", es / 60, es % 60, ds / 60, ds % 60);
+    } else {
+        snprintf(out, out_len, "%u:%02u", es / 60, es % 60);
+    }
+}
+
+static void audio_progress_callback(uint32_t elapsed_ms, void *ctx_ptr) {
+    audio_progress_ctx_t *ctx = (audio_progress_ctx_t *)ctx_ptr;
+    char text[MATRIX_AUDIO_STATUS_LEN];
+    format_audio_progress(text, sizeof(text), elapsed_ms, ctx->duration_ms);
+    matrix_set_audio_status(ctx->event_id, text);
+}
+
 static void media_download_task(void *arg) {
     matrix_media_request_t req = {0};
     if (arg != NULL) {
@@ -2300,6 +2342,8 @@ static void media_download_task(void *arg) {
     cJSON *info    = content ? cJSON_GetObjectItemCaseSensitive(content, "info") : NULL;
     cJSON *mime    = info ? cJSON_GetObjectItemCaseSensitive(info, "mimetype") : NULL;
     cJSON *size    = info ? cJSON_GetObjectItemCaseSensitive(info, "size") : NULL;
+    cJSON *duration = info ? cJSON_GetObjectItemCaseSensitive(info, "duration") : NULL;
+    uint32_t duration_ms = (cJSON_IsNumber(duration) && duration->valuedouble > 0) ? (uint32_t)duration->valuedouble : 0;
 
     bool is_audio = cJSON_IsString(msgtype) && strcmp(msgtype->valuestring, "m.audio") == 0;
     bool is_image = cJSON_IsString(msgtype) && strcmp(msgtype->valuestring, "m.image") == 0;
@@ -2330,11 +2374,26 @@ static void media_download_task(void *arg) {
     uint8_t *media_data = NULL;
     size_t media_len = 0;
     status = 0;
-    res = matrix_http_download_buffer(media_url, token_copy, max_bytes, &media_data, &media_len, &status);
+    if (is_image) {
+        char thumbnail_url[MATRIX_HOMESERVER_LEN + 700];
+        if (matrix_mxc_to_thumbnail_url(homeserver_copy, mxc->valuestring, thumbnail_url, sizeof(thumbnail_url))) {
+            res = matrix_http_download_buffer(thumbnail_url, token_copy, max_bytes, &media_data, &media_len, &status);
+        } else {
+            res = ESP_FAIL;
+        }
+    }
+    if (!is_image || res != ESP_OK) {
+        res = matrix_http_download_buffer(media_url, token_copy, max_bytes, &media_data, &media_len, &status);
+    }
     if (res == ESP_OK) {
         if (is_audio) {
             matrix_set_audio_status(req.event_id, "downloaded");
+            audio_progress_ctx_t progress_ctx;
+            snprintf(progress_ctx.event_id, sizeof(progress_ctx.event_id), "%s", req.event_id);
+            progress_ctx.duration_ms = duration_ms;
+            audio_player_set_progress_callback(audio_progress_callback, &progress_ctx);
             res = audio_player_play_buffer(media_data, media_len, mimetype, label, true);
+            audio_player_set_progress_callback(NULL, NULL);
             if (res != ESP_OK) {
                 matrix_set_audio_status(req.event_id, audio_player_last_error());
                 matrix_set_last_error(audio_player_last_error());
@@ -2342,6 +2401,7 @@ static void media_download_task(void *arg) {
                 matrix_set_audio_status(req.event_id, "played");
             }
             heap_caps_free(media_data);
+            media_data = NULL;
         } else {
             matrix_store_image_cache(req.event_id, mimetype, label, media_data, media_len);
             media_data = NULL;

@@ -18,6 +18,11 @@ const char *audio_player_last_error(void);
 void audio_player_set_volume_percent(int percent);
 int audio_player_get_volume_percent(void);
 
+/* Invoked from within audio_player_play_buffer roughly once per second of decoded
+ * audio, so callers can surface playback progress (e.g. "0:07 / 0:23") in the UI. */
+typedef void (*audio_player_progress_cb_t)(uint32_t elapsed_ms, void *ctx);
+void audio_player_set_progress_callback(audio_player_progress_cb_t cb, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

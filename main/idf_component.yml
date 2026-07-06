@@ -4,4 +4,5 @@ dependencies:
   nicolaielectronics/tanmatsu-wifi: "^1.1.2"
   robotman2412/pax-gfx: "^2.1.0"
   esphome/micro-opus: "*"
+  esphome/micro-vorbis: "^0.1.0"
   esp_jpeg: ">=1.0.2"

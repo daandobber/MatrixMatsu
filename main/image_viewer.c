@@ -12,6 +12,9 @@
 #define IMAGE_PREVIEW_MAX_DIM 720
 #define IMAGE_MAX_IDAT_BYTES  (4 * 1024 * 1024)
 #define IMAGE_MAX_RAW_BYTES   (12 * 1024 * 1024)
+/* tjpgd's built-in default pool (3.1kB) is too small for some real-world photos
+ * (extra Huffman/quant tables, 4:4:4 subsampling); give it a roomier scratch pool. */
+#define JPEG_DECODE_WORKBUF_SIZE (32 * 1024)
 
 static void set_err(char *err_out, size_t err_out_len, const char *text) {
     if (err_out != NULL && err_out_len > 0) snprintf(err_out, err_out_len, "%s", text);
@@ -106,6 +109,14 @@ static esp_err_t decode_jpeg(const uint8_t *data, size_t data_len, pax_buf_t *ou
         return ESP_ERR_NO_MEM;
     }
 
+    uint8_t *jpeg_workbuf = heap_caps_malloc(JPEG_DECODE_WORKBUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (jpeg_workbuf == NULL) jpeg_workbuf = heap_caps_malloc(JPEG_DECODE_WORKBUF_SIZE, MALLOC_CAP_8BIT);
+    if (jpeg_workbuf == NULL) {
+        heap_caps_free(pixels);
+        set_err(err, err_len, "jpg no mem");
+        return ESP_ERR_NO_MEM;
+    }
+
     esp_jpeg_image_cfg_t jpeg_cfg = {
         .indata = (uint8_t *)data,
         .indata_size = data_len,
@@ -113,9 +124,14 @@ static esp_err_t decode_jpeg(const uint8_t *data, size_t data_len, pax_buf_t *ou
         .outbuf_size = (size_t)out_w_est * (size_t)out_h_est * sizeof(uint16_t),
         .out_format = JPEG_IMAGE_FORMAT_RGB565,
         .out_scale = scale,
+        .advanced = {
+            .working_buffer = jpeg_workbuf,
+            .working_buffer_size = JPEG_DECODE_WORKBUF_SIZE,
+        },
     };
     esp_jpeg_image_output_t decoded = {0};
     esp_err_t res = esp_jpeg_decode(&jpeg_cfg, &decoded);
+    heap_caps_free(jpeg_workbuf);
     if (res != ESP_OK || decoded.width == 0 || decoded.height == 0) {
         heap_caps_free(pixels);
         if (err != NULL && err_len > 0) snprintf(err, err_len, "jpg %s", esp_err_to_name(res));
