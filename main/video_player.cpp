@@ -13,6 +13,9 @@ extern "C" {
 #include "esp_audio_dec.h"
 #include "esp_extractor.h"
 #include "esp_extractor_defaults.h"
+#include "esp_h264_dec.h"
+#include "esp_h264_dec_param.h"
+#include "esp_h264_dec_sw.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -186,6 +189,31 @@ bool next_nal(const uint8_t *data, size_t len, size_t *pos, size_t *nal_start, s
     return true;
 }
 
+/* tinyh264 (esp_h264's SW decoder) only accepts Baseline profile
+ * (profile_idc 66) -- confirmed on real hardware, where a High-profile
+ * (profile_idc 100) SPS is rejected outright ("profile_idc is error"). But
+ * it's dramatically faster than OpenH264 for content it CAN decode (measured
+ * elsewhere at 25-31fps @ 640x480 with esp_h264's own dual-task mode vs.
+ * OpenH264's ~6fps @ 384x384), since Baseline's CAVLC entropy coding and lack
+ * of B-frames are intrinsically cheaper than Main/High's CABAC. So: sniff the
+ * profile out of spec_info's SPS and prefer tinyh264 when it applies,
+ * falling back to OpenH264 (Main/High-capable but slower) otherwise. */
+bool spec_info_is_baseline(const uint8_t *spec_info, uint32_t len) {
+    if (spec_info == nullptr) return false;
+    size_t pos = 0, nal_start = 0, nal_len = 0;
+    while (next_nal(spec_info, len, &pos, &nal_start, &nal_len)) {
+        if (nal_len < 2) continue;
+        size_t hdr_off = (spec_info[nal_start + 2] == 1) ? 3 : 4;
+        if (nal_len <= hdr_off + 1) continue;
+        uint8_t nal_type = spec_info[nal_start + hdr_off] & 0x1f;
+        if (nal_type == 7) {  // SPS
+            uint8_t profile_idc = spec_info[nal_start + hdr_off + 1];
+            return profile_idc == 66;
+        }
+    }
+    return false;
+}
+
 /* Output is 24-bit RGB888 (3 bytes/pixel, B-G-R byte order -- confirmed
  * empirically on-device; "888RGB" naming in the BSP doesn't guarantee R is
  * byte 0), matching this app's actual configured display format (see main.c's
@@ -283,11 +311,26 @@ esp_err_t video_player_play_buffer(const uint8_t *data, size_t data_len, const c
         esp_extractor_close(extractor);
         return ESP_ERR_NOT_SUPPORTED;
     }
-    openh264_dec_t *h264_dec = openh264_dec_create();
-    if (h264_dec == nullptr) {
-        set_last_error("h264 decoder init failed");
-        esp_extractor_close(extractor);
-        return ESP_FAIL;
+    bool use_tinyh264 = spec_info_is_baseline(video_info.spec_info, video_info.spec_info_len);
+    openh264_dec_t *h264_dec_open = nullptr;
+    esp_h264_dec_handle_t h264_dec_tiny = nullptr;
+    if (use_tinyh264) {
+        esp_h264_dec_cfg_sw_t dec_cfg = {.pic_type = ESP_H264_RAW_FMT_I420};
+        if (esp_h264_dec_sw_new(&dec_cfg, &h264_dec_tiny) != ESP_H264_ERR_OK || h264_dec_tiny == nullptr) {
+            set_last_error("h264 decoder init failed");
+            esp_extractor_close(extractor);
+            return ESP_FAIL;
+        }
+        esp_h264_dec_open(h264_dec_tiny);
+        ESP_LOGI(TAG, "using tinyh264 (Baseline profile, fast path)");
+    } else {
+        h264_dec_open = openh264_dec_create();
+        if (h264_dec_open == nullptr) {
+            set_last_error("h264 decoder init failed");
+            esp_extractor_close(extractor);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "using OpenH264 (Main/High profile, slow path)");
     }
 
     void *aac_dec = nullptr;
@@ -330,6 +373,56 @@ esp_err_t video_player_play_buffer(const uint8_t *data, size_t data_len, const c
      * Remove once the perf question is answered. */
     int64_t total_read_us = 0, total_decode_us = 0, total_render_us = 0, total_blit_us = 0;
     int rendered_frame_count = 0;
+
+    /* Shared by both decode paths (tinyh264 and OpenH264 expose the decoded
+     * picture very differently -- see below -- but once reduced to a plane
+     * pointer + stride triple, everything from here on is identical). */
+    auto handle_decoded_picture = [&](
+                                       const uint8_t *y, const uint8_t *u, const uint8_t *v, int stride_y_,
+                                       int stride_uv_, int w, int h, uint32_t pts
+                                   ) {
+        got_any_frame = true;
+        if (dst_w == 0) {
+            dec_w = (uint16_t)w;
+            dec_h = (uint16_t)h;
+            /* Swapped on purpose: dst_w/dst_h represent the on-screen
+             * footprint *after* the 90-degree rotation baked into
+             * render_i420_scaled, where width and height trade places. */
+            compute_fit_size(dec_h, dec_w, &dst_w, &dst_h);
+            rgb_buf = static_cast<uint8_t *>(
+                heap_caps_malloc((size_t)dst_w * dst_h * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+            );
+            screen_x = (kScreenW > dst_w) ? (kScreenW - dst_w) / 2 : 0;
+            screen_y = (kScreenH > dst_h) ? (kScreenH - dst_h) / 2 : 0;
+            ESP_LOGW(
+                TAG, "video geometry: coded=%dx%d stride_y=%d stride_uv=%d dst=%ux%u screen=(%u,%u)", w, h, stride_y_,
+                stride_uv_, (unsigned)dst_w, (unsigned)dst_h, (unsigned)screen_x, (unsigned)screen_y
+            );
+        }
+
+        if (start_us < 0) start_us = esp_timer_get_time();
+        int64_t target_us = start_us + (int64_t)pts * 1000;
+        int64_t now_us = esp_timer_get_time();
+        if (target_us > now_us) {
+            vTaskDelay(pdMS_TO_TICKS((target_us - now_us) / 1000));
+        }
+
+        if (rgb_buf != nullptr && dec_w > 0 && dec_h > 0) {
+            int64_t t_render0 = esp_timer_get_time();
+            render_i420_scaled(
+                y, u, v, (uint16_t)stride_y_, (uint16_t)stride_uv_, dec_w, dec_h, rgb_buf, dst_w, dst_h
+            );
+            int64_t t_blit0 = esp_timer_get_time();
+            total_render_us += t_blit0 - t_render0;
+            /* bsp_display_blit forwards straight to esp_lcd_panel_draw_bitmap,
+             * whose real contract is (x_start, y_start, x_end, y_end) -- exclusive
+             * end coordinates, not a width/height pair, despite bsp/display.h's
+             * parameter names suggesting otherwise. */
+            bsp_display_blit(screen_x, screen_y, screen_x + dst_w, screen_y + dst_h, rgb_buf);
+            total_blit_us += esp_timer_get_time() - t_blit0;
+            rendered_frame_count++;
+        }
+    };
 
     while (!s_stop_requested) {
         esp_extractor_frame_info_t frame = {};
@@ -411,70 +504,66 @@ esp_err_t video_player_play_buffer(const uint8_t *data, size_t data_len, const c
                     }
                 }
             }
-            size_t nal_pos = 0, nal_start = 0, nal_len = 0;
-            while (next_nal(cursor, remain, &nal_pos, &nal_start, &nal_len)) {
-                uint8_t *out_y = nullptr, *out_u = nullptr, *out_v = nullptr;
-                int out_w = 0, out_h = 0, stride_y = 0, stride_uv = 0;
-                int64_t t_decode0 = esp_timer_get_time();
-                int dr = openh264_dec_decode(
-                    h264_dec, cursor + nal_start, (int)nal_len, &out_y, &out_u, &out_v, &out_w, &out_h, &stride_y,
-                    &stride_uv
-                );
-                total_decode_us += esp_timer_get_time() - t_decode0;
-                if (dr < 0) {
-                    ESP_LOGW(TAG, "h264 decode failed at NAL offset %u", (unsigned)nal_start);
-                    continue;
-                }
-                if (dr == 0) continue; /* SPS/PPS or not enough data yet for a picture */
+            if (use_tinyh264) {
+                /* tinyh264's contract: hand it the whole multi-NAL buffer at
+                 * once, it reports back how many bytes it consumed per call
+                 * (usually one NAL's worth) via in_frame.consume -- the
+                 * opposite of OpenH264's one-NAL-per-call contract below. */
+                while (remain > 0) {
+                    esp_h264_dec_in_frame_t in_frame = {};
+                    in_frame.raw_data.buffer = const_cast<uint8_t *>(cursor);
+                    in_frame.raw_data.len = remain;
+                    esp_h264_dec_out_frame_t out_frame = {};
+                    int64_t t_decode0 = esp_timer_get_time();
+                    esp_h264_err_t dr = esp_h264_dec_process(h264_dec_tiny, &in_frame, &out_frame);
+                    total_decode_us += esp_timer_get_time() - t_decode0;
+                    if (dr != ESP_H264_ERR_OK) {
+                        ESP_LOGW(TAG, "h264 decode failed: %d", (int)dr);
+                        break;
+                    }
+                    if (in_frame.consume == 0) break;
+                    cursor += in_frame.consume;
+                    remain -= in_frame.consume;
 
-                got_any_frame = true;
-                if (dst_w == 0) {
-                    dec_w = (uint16_t)out_w;
-                    dec_h = (uint16_t)out_h;
-                    /* Swapped on purpose: dst_w/dst_h represent the on-screen
-                     * footprint *after* the 90-degree rotation baked into
-                     * render_i420_scaled, where width and height trade places. */
-                    compute_fit_size(dec_h, dec_w, &dst_w, &dst_h);
-                    rgb_buf = static_cast<uint8_t *>(
-                        heap_caps_malloc((size_t)dst_w * dst_h * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-                    );
-                    screen_x = (kScreenW > dst_w) ? (kScreenW - dst_w) / 2 : 0;
-                    screen_y = (kScreenH > dst_h) ? (kScreenH - dst_h) / 2 : 0;
-                    ESP_LOGW(
-                        TAG, "video geometry: coded=%dx%d stride_y=%d stride_uv=%d dst=%ux%u screen=(%u,%u)", out_w,
-                        out_h, stride_y, stride_uv, (unsigned)dst_w, (unsigned)dst_h, (unsigned)screen_x,
-                        (unsigned)screen_y
-                    );
-                    char yhex[3 * 16 + 1] = "";
-                    char uhex[3 * 16 + 1] = "";
-                    for (int i = 0; i < 16; i++) snprintf(yhex + i * 3, 4, "%02x ", out_y[i]);
-                    for (int i = 0; i < 16; i++) snprintf(uhex + i * 3, 4, "%02x ", out_u[i]);
-                    ESP_LOGW(TAG, "first frame y[0..16)=%s", yhex);
-                    ESP_LOGW(TAG, "first frame u[0..16)=%s", uhex);
+                    if (out_frame.out_size > 0 && out_frame.outbuf != nullptr) {
+                        int frame_w = video_info.video_info.width;
+                        int frame_h = video_info.video_info.height;
+                        if (dst_w == 0) {
+                            esp_h264_resolution_t res = {video_info.video_info.width, video_info.video_info.height};
+                            esp_h264_dec_param_sw_handle_t param_hd = nullptr;
+                            if (esp_h264_dec_sw_get_param_hd(h264_dec_tiny, &param_hd) == ESP_H264_ERR_OK) {
+                                esp_h264_dec_get_resolution(param_hd, &res);
+                            }
+                            frame_w = res.width;
+                            frame_h = res.height;
+                        }
+                        /* tinyh264 hands back one tightly-packed I420 buffer
+                         * (no per-plane stride/padding), unlike OpenH264's
+                         * separate plane pointers + strides -- carve it up to
+                         * match handle_decoded_picture's shared interface. */
+                        const uint8_t *y = out_frame.outbuf;
+                        const uint8_t *u = y + (size_t)frame_w * frame_h;
+                        const uint8_t *v = u + (size_t)(frame_w / 2) * (frame_h / 2);
+                        handle_decoded_picture(y, u, v, frame_w, frame_w / 2, frame_w, frame_h, frame.pts);
+                    }
                 }
-
-                if (start_us < 0) start_us = esp_timer_get_time();
-                int64_t target_us = start_us + (int64_t)frame.pts * 1000;
-                int64_t now_us = esp_timer_get_time();
-                if (target_us > now_us) {
-                    vTaskDelay(pdMS_TO_TICKS((target_us - now_us) / 1000));
-                }
-
-                if (rgb_buf != nullptr && dec_w > 0 && dec_h > 0) {
-                    int64_t t_render0 = esp_timer_get_time();
-                    render_i420_scaled(
-                        out_y, out_u, out_v, (uint16_t)stride_y, (uint16_t)stride_uv, dec_w, dec_h, rgb_buf, dst_w,
-                        dst_h
+            } else {
+                size_t nal_pos = 0, nal_start = 0, nal_len = 0;
+                while (next_nal(cursor, remain, &nal_pos, &nal_start, &nal_len)) {
+                    uint8_t *out_y = nullptr, *out_u = nullptr, *out_v = nullptr;
+                    int out_w = 0, out_h = 0, stride_y = 0, stride_uv = 0;
+                    int64_t t_decode0 = esp_timer_get_time();
+                    int dr = openh264_dec_decode(
+                        h264_dec_open, cursor + nal_start, (int)nal_len, &out_y, &out_u, &out_v, &out_w, &out_h,
+                        &stride_y, &stride_uv
                     );
-                    int64_t t_blit0 = esp_timer_get_time();
-                    total_render_us += t_blit0 - t_render0;
-                    /* bsp_display_blit forwards straight to esp_lcd_panel_draw_bitmap,
-                     * whose real contract is (x_start, y_start, x_end, y_end) -- exclusive
-                     * end coordinates, not a width/height pair, despite bsp/display.h's
-                     * parameter names suggesting otherwise. */
-                    bsp_display_blit(screen_x, screen_y, screen_x + dst_w, screen_y + dst_h, rgb_buf);
-                    total_blit_us += esp_timer_get_time() - t_blit0;
-                    rendered_frame_count++;
+                    total_decode_us += esp_timer_get_time() - t_decode0;
+                    if (dr < 0) {
+                        ESP_LOGW(TAG, "h264 decode failed at NAL offset %u", (unsigned)nal_start);
+                        continue;
+                    }
+                    if (dr == 0) continue; /* SPS/PPS or not enough data yet for a picture */
+                    handle_decoded_picture(out_y, out_u, out_v, stride_y, stride_uv, out_w, out_h, frame.pts);
                 }
             }
             heap_caps_free(combined);
@@ -565,7 +654,12 @@ esp_err_t video_player_play_buffer(const uint8_t *data, size_t data_len, const c
     heap_caps_free(stereo_pcm);
     heap_caps_free(rgb_buf);
     if (aac_dec != nullptr) esp_aac_dec_close(aac_dec);
-    openh264_dec_destroy(h264_dec);
+    if (use_tinyh264) {
+        esp_h264_dec_close(h264_dec_tiny);
+        esp_h264_dec_del(h264_dec_tiny);
+    } else {
+        openh264_dec_destroy(h264_dec_open);
+    }
     esp_extractor_close(extractor);
 
     if (result != ESP_OK) return result;
