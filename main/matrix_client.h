@@ -95,6 +95,10 @@ void      matrix_set_persistence_enabled(bool enabled);
 esp_err_t matrix_restore_session(void);
 void      matrix_clear_persisted_session(void);
 
+// Video playback is still experimental; lets Settings turn it off so incoming
+// m.video messages are treated as unsupported media instead of decoded.
+void matrix_set_video_playback_enabled(bool enabled);
+
 // Attempt to discover & log in to a homeserver. `homeserver_input` may be a bare
 // server name (e.g. "matrix.org") or a full URL. Blocks until finished (performs
 // network I/O), intended to be called from a dedicated task, not the UI task.

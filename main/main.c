@@ -112,6 +112,7 @@ static int room_selected = 0;
 static int room_scroll   = 0;
 static bool room_list_show_all = false;
 static bool debug_status = false;
+static bool video_playback_enabled = true; // still experimental, see Settings
 
 // Chat state
 static int  chat_room_index     = -1;
@@ -1922,6 +1923,10 @@ static void load_saved_account(void) {
     if (nvs_get_u8(nvs, "debug_status", &debug) == ESP_OK) {
         debug_status = debug != 0;
     }
+    uint8_t video_enabled = 1;
+    if (nvs_get_u8(nvs, "video_enabled", &video_enabled) == ESP_OK) {
+        video_playback_enabled = video_enabled != 0;
+    }
 
     if (remember_account) {
         size_t len = sizeof(login_homeserver);
@@ -1947,6 +1952,7 @@ static void save_account_settings(void) {
     nvs_set_u8(nvs, "remember_pw", remember_password ? 1 : 0);
     nvs_set_u8(nvs, "show_all", room_list_show_all ? 1 : 0);
     nvs_set_u8(nvs, "debug_status", debug_status ? 1 : 0);
+    nvs_set_u8(nvs, "video_enabled", video_playback_enabled ? 1 : 0);
     nvs_set_i32(nvs, "theme", theme_index);
     nvs_set_i32(nvs, "font_size", font_size_index);
     if (remember_account) {
@@ -2877,7 +2883,7 @@ static bool handle_input_menu(bsp_input_event_t *event) {
 static bool handle_input_settings(bsp_input_event_t *event) {
     if (event->type != INPUT_EVENT_TYPE_NAVIGATION || !event->args_navigation.state) return false;
 
-    const int item_count = 8;
+    const int item_count = 9;
     switch (event->args_navigation.key) {
         case BSP_INPUT_NAVIGATION_KEY_UP:
             settings_selected = (settings_selected + item_count - 1) % item_count;
@@ -2929,6 +2935,12 @@ static bool handle_input_settings(bsp_input_event_t *event) {
                 return true;
             }
             if (settings_selected == 6) {
+                video_playback_enabled = !video_playback_enabled;
+                matrix_set_video_playback_enabled(video_playback_enabled);
+                save_account_settings();
+                return true;
+            }
+            if (settings_selected == 7) {
                 clear_saved_account();
                 save_account_settings();
                 return true;
@@ -2978,16 +2990,19 @@ static void render_settings(void) {
     char debug_line[96];
     char theme_line[96];
     char size_line[96];
+    char video_line[96];
     snprintf(remember_line, sizeof(remember_line), "Remember account: %s", remember_account ? "on" : "off");
     snprintf(password_line, sizeof(password_line), "Remember password: %s", remember_password ? "on" : "off");
     snprintf(all_rooms_line, sizeof(all_rooms_line), "Show all rooms: %s", room_list_show_all ? "on" : "off");
     snprintf(debug_line, sizeof(debug_line), "Debug status: %s", debug_status ? "on" : "off");
     snprintf(theme_line, sizeof(theme_line), "Theme: %s", theme_name());
     snprintf(size_line, sizeof(size_line), "Text size: %.0f", g_font_size);
+    snprintf(video_line, sizeof(video_line), "Play videos (experimental): %s", video_playback_enabled ? "on" : "off");
     const char *items[] = {
-        remember_line, password_line, theme_line, size_line, all_rooms_line, debug_line, "Clear saved account", "Back"
+        remember_line, password_line, theme_line, size_line, all_rooms_line, debug_line, video_line,
+        "Clear saved account", "Back"
     };
-    const int item_count = 8;
+    const int item_count = 9;
     for (int i = 0; i < item_count; i++) {
         float y = box_y + g_line_h * (i + 1);
         if (i == settings_selected) {
@@ -3272,6 +3287,7 @@ void app_main(void) {
     load_saved_account();
     ESP_ERROR_CHECK(matrix_client_init());
     matrix_set_persistence_enabled(remember_password);
+    matrix_set_video_playback_enabled(video_playback_enabled);
     bool restored_session = false;
     if (remember_password && matrix_restore_session() == ESP_OK) {
         restored_session = true;

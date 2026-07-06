@@ -120,6 +120,7 @@ typedef struct {
 
 static matrix_session_t *s_session = NULL;
 static bool              s_persistence_enabled = false;
+static bool              s_video_playback_enabled = true;
 static int64_t           s_last_persist_us     = 0;
 static bool              s_sd_mount_attempted  = false;
 static bool              s_sd_mounted          = false;
@@ -2348,7 +2349,7 @@ static void media_download_task(void *arg) {
 
     bool is_audio = cJSON_IsString(msgtype) && strcmp(msgtype->valuestring, "m.audio") == 0;
     bool is_image = cJSON_IsString(msgtype) && strcmp(msgtype->valuestring, "m.image") == 0;
-    bool is_video = cJSON_IsString(msgtype) && strcmp(msgtype->valuestring, "m.video") == 0;
+    bool is_video = cJSON_IsString(msgtype) && strcmp(msgtype->valuestring, "m.video") == 0 && s_video_playback_enabled;
     if ((!is_audio && !is_image && !is_video) || !cJSON_IsString(mxc) || strncmp(mxc->valuestring, "mxc://", 6) != 0) {
         cJSON_Delete(root);
         matrix_set_audio_status(req.event_id, "not media");
@@ -2551,6 +2552,10 @@ void matrix_set_persistence_enabled(bool enabled) {
     if (!enabled) {
         matrix_clear_persisted_session();
     }
+}
+
+void matrix_set_video_playback_enabled(bool enabled) {
+    s_video_playback_enabled = enabled;
 }
 
 void matrix_clear_persisted_session(void) {
