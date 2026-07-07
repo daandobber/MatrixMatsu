@@ -56,8 +56,11 @@ static float     g_font_size     = 16.0f;
 
 #define WRAP_LINE_LEN        96
 #define MAX_WRAP_LINES_TOTAL 400
-#define EMOJI_EXT_MARKER     31
-#define EMOJI_FLAG_PAIR_MARKER 116
+// A single control byte (never present in normal text) introduces a 3-byte inline
+// emoji reference: EMOJI_MARKER_BYTE, then a 2-byte index (see emoji_encode_index /
+// emoji_decode_index below) into EMOJI_TABLE. Every emoji, including flags, goes
+// through this one path.
+#define EMOJI_MARKER_BYTE    31
 
 // Global display / input state
 static size_t                     display_h_res       = 0;
@@ -390,13 +393,9 @@ static int wrap_text(const char *text, int max_cols, char lines[][WRAP_LINE_LEN]
             if (*cursor == ' ') {
                 last_space = cursor;
             }
-            if ((unsigned char)*cursor == EMOJI_EXT_MARKER && cursor[1] != '\0') {
+            if ((unsigned char)*cursor == EMOJI_MARKER_BYTE && cursor[1] != '\0' && cursor[2] != '\0') {
                 if (col + 1 > max_cols) break;
-                if ((unsigned char)cursor[1] == EMOJI_FLAG_PAIR_MARKER && cursor[2] != '\0' && cursor[3] != '\0') {
-                    cursor += 4;
-                } else {
-                    cursor += 2;
-                }
+                cursor += 3;
             } else {
                 cursor++;
             }
@@ -436,6 +435,10 @@ static int wrap_text(const char *text, int max_cols, char lines[][WRAP_LINE_LEN]
     return line_count;
 }
 
+// Legacy hand-drawn icon set (~110 concepts). These markers are only ever used
+// in-memory as a parameter to draw_emoji_icon_legacy(): the offline (no SD card)
+// fallback renderer for the subset of EMOJI_TABLE that still has a hand-drawn
+// vector icon. They are never encoded into text buffers.
 #define EMOJI_GENERIC     1
 #define EMOJI_SMILE       2
 #define EMOJI_GRIN        3
@@ -466,7 +469,6 @@ static int wrap_text(const char *text, int max_cols, char lines[][WRAP_LINE_LEN]
 #define EMOJI_MUSIC       28
 #define EMOJI_PIZZA       29
 #define EMOJI_COFFEE      30
-#define EMOJI_EXT         EMOJI_EXT_MARKER
 #define EMOJI_WINK        32
 #define EMOJI_BLUSH       33
 #define EMOJI_KISS        34
@@ -551,151 +553,25 @@ static int wrap_text(const char *text, int max_cols, char lines[][WRAP_LINE_LEN]
 #define EMOJI_PIN         113
 #define EMOJI_FLAG_GENERIC 114
 #define EMOJI_FLAG_EU      115
-#define EMOJI_FLAG_PAIR    EMOJI_FLAG_PAIR_MARKER
 
-typedef struct {
-    uint8_t     marker;
-    const char *utf8;
-    const char *label;
-} emoji_choice_t;
+#include "emoji_table.h"
 
-static const emoji_choice_t EMOJI_CHOICES[] = {
-    {EMOJI_FLAG_NL, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1", "nl flag"},
-    {EMOJI_SMILE, "\xF0\x9F\x99\x82", "smile"},
-    {EMOJI_GRIN, "\xF0\x9F\x98\x80", "grin"},
-    {EMOJI_JOY, "\xF0\x9F\x98\x82", "joy"},
-    {EMOJI_HEART_EYES, "\xF0\x9F\x98\x8D", "love"},
-    {EMOJI_COOL, "\xF0\x9F\x98\x8E", "cool"},
-    {EMOJI_CRY, "\xF0\x9F\x98\xA2", "cry"},
-    {EMOJI_THINKING, "\xF0\x9F\xA4\x94", "think"},
-    {EMOJI_ANGRY, "\xF0\x9F\x98\xA1", "angry"},
-    {EMOJI_SKULL, "\xF0\x9F\x92\x80", "skull"},
-    {EMOJI_EYES, "\xF0\x9F\x91\x80", "eyes"},
-    {EMOJI_THUMBS_UP, "\xF0\x9F\x91\x8D", "thumb up"},
-    {EMOJI_THUMBS_DOWN, "\xF0\x9F\x91\x8E", "thumb down"},
-    {EMOJI_WAVE, "\xF0\x9F\x91\x8B", "wave"},
-    {EMOJI_PRAY, "\xF0\x9F\x99\x8F", "pray"},
-    {EMOJI_HEART, "\xE2\x9D\xA4\xEF\xB8\x8F", "heart"},
-    {EMOJI_FIRE, "\xF0\x9F\x94\xA5", "fire"},
-    {EMOJI_PARTY, "\xF0\x9F\x8E\x89", "party"},
-    {EMOJI_ROCKET, "\xF0\x9F\x9A\x80", "rocket"},
-    {EMOJI_STAR, "\xE2\xAD\x90", "star"},
-    {EMOJI_CHECK, "\xE2\x9C\x85", "check"},
-    {EMOJI_CROSS, "\xE2\x9D\x8C", "cross"},
-    {EMOJI_HUNDRED, "\xF0\x9F\x92\xAF", "hundred"},
-    {EMOJI_SUN, "\xE2\x98\x80\xEF\xB8\x8F", "sun"},
-    {EMOJI_MOON, "\xF0\x9F\x8C\x99", "moon"},
-    {EMOJI_BOLT, "\xE2\x9A\xA1", "bolt"},
-    {EMOJI_GIFT, "\xF0\x9F\x8E\x81", "gift"},
-    {EMOJI_MUSIC, "\xF0\x9F\x8E\xB5", "music"},
-    {EMOJI_PIZZA, "\xF0\x9F\x8D\x95", "pizza"},
-    {EMOJI_COFFEE, "\xE2\x98\x95", "coffee"},
-    {EMOJI_SMILE, "\xF0\x9F\x98\x89", "wink"},
-    {EMOJI_SMILE, "\xF0\x9F\x98\x8A", "blush"},
-    {EMOJI_HEART_EYES, "\xF0\x9F\x98\x98", "kiss"},
-    {EMOJI_THUMBS_UP, "\xF0\x9F\x92\xAA", "strong"},
-    {EMOJI_WAVE, "\xF0\x9F\x91\x8F", "clap"},
-    {EMOJI_WINK, "\xF0\x9F\x98\x89", "wink"},
-    {EMOJI_BLUSH, "\xF0\x9F\x98\x8A", "blush"},
-    {EMOJI_KISS, "\xF0\x9F\x98\x98", "kiss"},
-    {EMOJI_HEART_HANDS, "\xF0\x9F\xAB\xB6", "heart hands"},
-    {EMOJI_STRONG, "\xF0\x9F\x92\xAA", "strong"},
-    {EMOJI_CLAP, "\xF0\x9F\x91\x8F", "clap"},
-    {EMOJI_SOB, "\xF0\x9F\x98\xAD", "sob"},
-    {EMOJI_ROFL, "\xF0\x9F\xA4\xA3", "rofl"},
-    {EMOJI_MELTING, "\xF0\x9F\xAB\xA0", "melting"},
-    {EMOJI_PLEADING, "\xF0\x9F\xA5\xBA", "plead"},
-    {EMOJI_NEUTRAL, "\xF0\x9F\x98\x90", "neutral"},
-    {EMOJI_UNAMUSED, "\xF0\x9F\x98\x92", "unamused"},
-    {EMOJI_SWEAT_SMILE, "\xF0\x9F\x98\x85", "sweat smile"},
-    {EMOJI_RELIEVED, "\xF0\x9F\x98\x8C", "relieved"},
-    {EMOJI_SLEEPING, "\xF0\x9F\x98\xB4", "sleep"},
-    {EMOJI_FLUSHED, "\xF0\x9F\x98\xB3", "flushed"},
-    {EMOJI_SCREAM, "\xF0\x9F\x98\xB1", "scream"},
-    {EMOJI_MIND_BLOWN, "\xF0\x9F\xA4\xAF", "mind blown"},
-    {EMOJI_SMIRK, "\xF0\x9F\x98\x8F", "smirk"},
-    {EMOJI_ZANY, "\xF0\x9F\xA4\xAA", "zany"},
-    {EMOJI_PARTY_FACE, "\xF0\x9F\xA5\xB3", "party face"},
-    {EMOJI_HUGGING, "\xF0\x9F\xA4\x97", "hug"},
-    {EMOJI_SHUSHING, "\xF0\x9F\xA4\xAB", "shush"},
-    {EMOJI_FACEPALM, "\xF0\x9F\xA4\xA6", "facepalm"},
-    {EMOJI_SHRUG, "\xF0\x9F\xA4\xB7", "shrug"},
-    {EMOJI_OK_HAND, "\xF0\x9F\x91\x8C", "ok"},
-    {EMOJI_RAISED_HANDS, "\xF0\x9F\x99\x8C", "raised"},
-    {EMOJI_POINT_RIGHT, "\xF0\x9F\x91\x89", "right"},
-    {EMOJI_POINT_LEFT, "\xF0\x9F\x91\x88", "left"},
-    {EMOJI_POINT_UP, "\xE2\x98\x9D", "up"},
-    {EMOJI_POINT_DOWN, "\xF0\x9F\x91\x87", "down"},
-    {EMOJI_HANDSHAKE, "\xF0\x9F\xA4\x9D", "handshake"},
-    {EMOJI_ORANGE_HEART, "\xF0\x9F\xA7\xA1", "orange heart"},
-    {EMOJI_YELLOW_HEART, "\xF0\x9F\x92\x9B", "yellow heart"},
-    {EMOJI_GREEN_HEART, "\xF0\x9F\x92\x9A", "green heart"},
-    {EMOJI_BLUE_HEART, "\xF0\x9F\x92\x99", "blue heart"},
-    {EMOJI_PURPLE_HEART, "\xF0\x9F\x92\x9C", "purple heart"},
-    {EMOJI_BLACK_HEART, "\xF0\x9F\x96\xA4", "black heart"},
-    {EMOJI_BROKEN_HEART, "\xF0\x9F\x92\x94", "broken heart"},
-    {EMOJI_SPARKLES, "\xE2\x9C\xA8", "sparkles"},
-    {EMOJI_POOP, "\xF0\x9F\x92\xA9", "poop"},
-    {EMOJI_BOOM, "\xF0\x9F\x92\xA5", "boom"},
-    {EMOJI_DROPS, "\xF0\x9F\x92\xA6", "drops"},
-    {EMOJI_ZZZ, "\xF0\x9F\x92\xA4", "zzz"},
-    {EMOJI_DASH, "\xF0\x9F\x92\xA8", "dash"},
-    {EMOJI_MONKEY_SEE, "\xF0\x9F\x99\x88", "monkey"},
-    {EMOJI_CAT_SMILE, "\xF0\x9F\x98\xBA", "cat smile"},
-    {EMOJI_DOG, "\xF0\x9F\x90\xB6", "dog"},
-    {EMOJI_CAT, "\xF0\x9F\x90\xB1", "cat"},
-    {EMOJI_BEER, "\xF0\x9F\x8D\xBA", "beer"},
-    {EMOJI_WINE, "\xF0\x9F\x8D\xB7", "wine"},
-    {EMOJI_BURGER, "\xF0\x9F\x8D\x94", "burger"},
-    {EMOJI_FRIES, "\xF0\x9F\x8D\x9F", "fries"},
-    {EMOJI_CAKE, "\xF0\x9F\x8E\x82", "cake"},
-    {EMOJI_SOCCER, "\xE2\x9A\xBD", "soccer"},
-    {EMOJI_GAME, "\xF0\x9F\x8E\xAE", "game"},
-    {EMOJI_PHONE, "\xF0\x9F\x93\xB1", "phone"},
-    {EMOJI_LAPTOP, "\xF0\x9F\x92\xBB", "laptop"},
-    {EMOJI_BULB, "\xF0\x9F\x92\xA1", "bulb"},
-    {EMOJI_MONEY, "\xF0\x9F\x92\xB0", "money"},
-    {EMOJI_GEM, "\xF0\x9F\x92\x8E", "gem"},
-    {EMOJI_WARNING, "\xE2\x9A\xA0", "warning"},
-    {EMOJI_QUESTION, "\xE2\x9D\x93", "question"},
-    {EMOJI_EXCLAMATION, "\xE2\x9D\x97", "bang"},
-    {EMOJI_CALENDAR, "\xF0\x9F\x93\x85", "calendar"},
-    {EMOJI_CLOCK, "\xF0\x9F\x95\x92", "clock"},
-    {EMOJI_HOME, "\xF0\x9F\x8F\xA0", "home"},
-    {EMOJI_CAR, "\xF0\x9F\x9A\x97", "car"},
-    {EMOJI_TRAIN, "\xF0\x9F\x9A\x86", "train"},
-    {EMOJI_AIRPLANE, "\xE2\x9C\x88", "plane"},
-    {EMOJI_GLOBE, "\xF0\x9F\x8C\x8D", "globe"},
-    {EMOJI_FLAG_NL, "\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1", "nl flag"},
-    {EMOJI_RAINBOW, "\xF0\x9F\x8C\x88", "rainbow"},
-    {EMOJI_SNOWFLAKE, "\xE2\x9D\x84", "snow"},
-    {EMOJI_UMBRELLA, "\xE2\x98\x94", "rain"},
-    {EMOJI_CLOUD, "\xE2\x98\x81", "cloud"},
-    {EMOJI_LOCK, "\xF0\x9F\x94\x92", "lock"},
-    {EMOJI_KEY, "\xF0\x9F\x94\x91", "key"},
-    {EMOJI_GEAR, "\xE2\x9A\x99", "gear"},
-    {EMOJI_MAGNIFY, "\xF0\x9F\x94\x8D", "search"},
-    {EMOJI_BELL, "\xF0\x9F\x94\x94", "bell"},
-    {EMOJI_PIN, "\xF0\x9F\x93\x8C", "pin"},
-};
+// Emoji picker filter state: typing narrows by label substring; TAB cycles
+// through categories (-1 = all groups). The filtered index list is recomputed
+// whenever either changes.
+static char emoji_search[24]              = "";
+static int  emoji_category                = -1;
+static int  emoji_filtered[EMOJI_TABLE_COUNT];
+static int  emoji_filtered_count           = EMOJI_TABLE_COUNT;
 
-static const int EMOJI_CHOICE_COUNT = sizeof(EMOJI_CHOICES) / sizeof(EMOJI_CHOICES[0]);
 #define EMOJI_PICKER_COLS 6
 #define EMOJI_ASSET_SIZE  32
-#define EMOJI_ASSET_CACHE 8
-#define EMOJI_NAMED_ASSET_CACHE 6
+// Every emoji (message rendering and the picker) loads its raster asset from SD
+// by its codepoint-hex key through this one LRU cache.
+#define EMOJI_NAMED_ASSET_CACHE 16
 #define APP_REPOSITORY_SLUG "nl.daandobber.matrixmatsu"
 #define EMOJI_PACK_MAGIC 0x314B5045u
 #define EMOJI_PACK_ENTRY_NAME_LEN 32
-
-typedef struct {
-    uint8_t   marker;
-    bool      loaded;
-    bool      failed;
-    uint32_t  last_used;
-    void     *pixels;
-    pax_buf_t image;
-} emoji_asset_t;
 
 typedef struct {
     char      name[24];
@@ -706,7 +582,6 @@ typedef struct {
     pax_buf_t image;
 } emoji_named_asset_t;
 
-static emoji_asset_t g_emoji_assets[EMOJI_ASSET_CACHE];
 static emoji_named_asset_t g_named_emoji_assets[EMOJI_NAMED_ASSET_CACHE];
 static bool          g_sd_mount_attempted = false;
 static bool          g_sd_mounted         = false;
@@ -866,31 +741,67 @@ static uint8_t emoji_marker(uint32_t cp) {
 }
 
 static bool is_emoji_marker(unsigned char c) {
-    return c >= EMOJI_GENERIC && c <= EMOJI_EXT;
+    return c == EMOJI_MARKER_BYTE;
 }
 
-static bool append_emoji_marker(char *out, size_t out_len, size_t *o, uint8_t marker) {
-    if (marker <= EMOJI_COFFEE) {
-        if (*o + 1 >= out_len) return false;
-        out[(*o)++] = (char)marker;
-        out[*o]     = '\0';
-        return true;
+// Sentinel indices past the end of EMOJI_TABLE for the handful of concepts that
+// don't have a table entry: a generic "unrecognized emoji" placeholder, and the
+// three tag-sequence flags (novelty NL/EU + a generic fallback for others, e.g.
+// England/Scotland/Wales) which only ever exist as hand-drawn icons.
+#define EMOJI_IDX_PLACEHOLDER  (EMOJI_TABLE_COUNT)
+#define EMOJI_IDX_FLAG_NL      (EMOJI_TABLE_COUNT + 1)
+#define EMOJI_IDX_FLAG_EU      (EMOJI_TABLE_COUNT + 2)
+#define EMOJI_IDX_FLAG_GENERIC (EMOJI_TABLE_COUNT + 3)
+
+// Two data bytes, each biased into [1,255] so a marker sequence never contains a
+// 0x00 byte (which would truncate the C string it lives in).
+static bool append_emoji_marker(char *out, size_t out_len, size_t *o, uint16_t index) {
+    if (*o + 3 >= out_len) return false;
+    uint8_t b1 = (uint8_t)(1 + (index / 255));
+    uint8_t b2 = (uint8_t)(1 + (index % 255));
+    out[(*o)++] = (char)EMOJI_MARKER_BYTE;
+    out[(*o)++] = (char)b1;
+    out[(*o)++] = (char)b2;
+    out[*o]     = '\0';
+    return true;
+}
+
+static uint16_t emoji_decode_index(unsigned char b1, unsigned char b2) {
+    return (uint16_t)(((uint16_t)(b1 - 1)) * 255 + (uint16_t)(b2 - 1));
+}
+
+// Builds the canonical "hex-hex-...-hex" lookup key for a cluster of codepoints,
+// matching the key format baked into EMOJI_TABLE by tools/gen-emoji-table.py.
+static void build_emoji_key(const uint32_t *cps, int n, char *out, size_t out_len) {
+    size_t o = 0;
+    out[0]   = '\0';
+    for (int k = 0; k < n && o + 1 < out_len; k++) {
+        if (k > 0) {
+            if (o + 1 >= out_len) break;
+            out[o++] = '-';
+        }
+        int written = snprintf(out + o, out_len - o, "%x", (unsigned int)cps[k]);
+        if (written < 0) break;
+        o += (size_t)written;
+        if (o >= out_len) { o = out_len - 1; break; }
     }
-    if (*o + 2 >= out_len) return false;
-    out[(*o)++] = (char)EMOJI_EXT;
-    out[(*o)++] = (char)marker;
-    out[*o]     = '\0';
-    return true;
+    out[o] = '\0';
 }
 
-static bool append_flag_pair_marker(char *out, size_t out_len, size_t *o, char first, char second) {
-    if (*o + 4 >= out_len) return false;
-    out[(*o)++] = (char)EMOJI_EXT;
-    out[(*o)++] = (char)EMOJI_FLAG_PAIR;
-    out[(*o)++] = first;
-    out[(*o)++] = second;
-    out[*o]     = '\0';
-    return true;
+static int emoji_table_lookup(const uint32_t *cps, int n) {
+    if (n <= 0) return -1;
+    char key[40];
+    build_emoji_key(cps, n, key, sizeof(key));
+
+    int lo = 0, hi = EMOJI_TABLE_COUNT - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int cmp = strcmp(key, EMOJI_TABLE[mid].key);
+        if (cmp == 0) return mid;
+        if (cmp < 0) hi = mid - 1;
+        else lo = mid + 1;
+    }
+    return -1;
 }
 
 static bool try_decode_utf16_surrogate_pair(const char *in, size_t *i, uint32_t high, uint32_t *out_cp) {
@@ -997,76 +908,115 @@ static bool try_parse_tag_flag(const char *in, size_t *i, uint8_t *out_marker) {
     return true;
 }
 
+// Attempts to read one emoji "cluster" starting at *i: a single codepoint, a
+// ZWJ-joined sequence (variation selectors, skin tones and hair styles are
+// absorbed and dropped since EMOJI_TABLE only carries the default "yellow"
+// glyph), a country-flag regional-indicator pair, or a black-flag tag sequence.
+// On success advances *i past the cluster and returns true with *out_index set
+// to an EMOJI_TABLE index (or one of the EMOJI_IDX_* sentinels). On failure *i
+// is left untouched.
+static bool read_emoji_cluster_index(const char *in, size_t *i, uint16_t *out_index) {
+    size_t   cursor = *i;
+    uint32_t cp0;
+    read_next_text_codepoint(in, &cursor, &cp0);
+
+    if (cp0 == 0x1F3F4) {
+        size_t  tag_cursor = cursor;
+        uint8_t legacy_flag;
+        if (try_parse_tag_flag(in, &tag_cursor, &legacy_flag)) {
+            *out_index = legacy_flag == EMOJI_FLAG_NL   ? EMOJI_IDX_FLAG_NL
+                         : legacy_flag == EMOJI_FLAG_EU  ? EMOJI_IDX_FLAG_EU
+                                                          : EMOJI_IDX_FLAG_GENERIC;
+            *i = tag_cursor;
+            return true;
+        }
+    }
+
+    if (cp0 >= 0x1F1E6 && cp0 <= 0x1F1FF) {
+        size_t next_cursor = cursor;
+        skip_emoji_joiners(in, &next_cursor);
+        uint32_t cp1;
+        read_next_text_codepoint(in, &next_cursor, &cp1);
+        if (cp1 >= 0x1F1E6 && cp1 <= 0x1F1FF) {
+            uint32_t pair[2] = {cp0, cp1};
+            int      idx     = emoji_table_lookup(pair, 2);
+            if (idx >= 0) {
+                *out_index = (uint16_t)idx;
+                *i         = next_cursor;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    uint32_t cps[16];
+    int      n = 0;
+    cps[n++]   = cp0;
+
+    for (;;) {
+        if (in[cursor] == '\0' || n >= (int)(sizeof(cps) / sizeof(cps[0]))) break;
+        size_t   next_cursor = cursor;
+        uint32_t cp;
+        read_next_text_codepoint(in, &next_cursor, &cp);
+
+        if (cp == 0xFE0F || cp == 0xFE0E) { cursor = next_cursor; continue; }
+        if (cp >= 0x1F3FB && cp <= 0x1F3FF) { cursor = next_cursor; continue; }
+        if (cp >= 0x1F9B0 && cp <= 0x1F9B3) { cursor = next_cursor; continue; }
+
+        if (cp == 0x200D) {
+            // The ZWJ itself is part of the lookup key (matches
+            // tools/gen-emoji-table.py, which only strips FE0F), so it's kept
+            // as its own cps[] element alongside the codepoint it joins.
+            if (n + 1 >= (int)(sizeof(cps) / sizeof(cps[0]))) break;
+            size_t after_zwj = next_cursor;
+            if (in[after_zwj] == '\0') break;
+            uint32_t joined_cp;
+            read_next_text_codepoint(in, &after_zwj, &joined_cp);
+            cps[n++]  = 0x200D;
+            cps[n++]  = joined_cp;
+            cursor    = after_zwj;
+            continue;
+        }
+        break;
+    }
+
+    int idx = emoji_table_lookup(cps, n);
+    if (idx < 0 && (cps[0] == 0x1F468 || cps[0] == 0x1F469)) {
+        // Gendered role/activity (e.g. "woman firefighter"): our table only keeps
+        // the neutral "person" version, so retry with that substituted in.
+        uint32_t alt[16];
+        memcpy(alt, cps, sizeof(uint32_t) * (size_t)n);
+        alt[0] = 0x1F9D1;
+        idx    = emoji_table_lookup(alt, n);
+    }
+    if (idx < 0 && n > 1) {
+        idx = emoji_table_lookup(cps, 1);
+    }
+    if (idx < 0) return false;
+
+    *out_index = (uint16_t)idx;
+    *i         = cursor;
+    return true;
+}
+
 static void text_with_emoji_markers(const char *in, char *out, size_t out_len) {
     size_t i = 0, o = 0;
     if (out_len == 0) return;
     out[0] = '\0';
     while (in != NULL && in[i] != '\0' && o + 1 < out_len) {
-        static const unsigned char nl_flag_utf8[] = {0xF0, 0x9F, 0x87, 0xB3, 0xF0, 0x9F, 0x87, 0xB1, 0x00};
-        if (memcmp((const unsigned char *)&in[i], nl_flag_utf8, sizeof(nl_flag_utf8) - 1) == 0) {
-            if (!append_emoji_marker(out, out_len, &o, EMOJI_FLAG_NL)) break;
-            i += sizeof(nl_flag_utf8) - 1;
-            continue;
-        }
-        static const unsigned char eu_flag_utf8[] = {0xF0, 0x9F, 0x87, 0xAA, 0xF0, 0x9F, 0x87, 0xBA, 0x00};
-        if (memcmp((const unsigned char *)&in[i], eu_flag_utf8, sizeof(eu_flag_utf8) - 1) == 0) {
-            if (!append_emoji_marker(out, out_len, &o, EMOJI_FLAG_EU)) break;
-            i += sizeof(eu_flag_utf8) - 1;
-            continue;
-        }
-        static const unsigned char nl_flag_surrogate_utf8[] = {
-            0xED, 0xA0, 0xBC, 0xED, 0xB7, 0xB3, 0xED, 0xA0, 0xBC, 0xED, 0xB7, 0xB1, 0x00
-        };
-        if (memcmp((const unsigned char *)&in[i], nl_flag_surrogate_utf8, sizeof(nl_flag_surrogate_utf8) - 1) == 0) {
-            if (!append_emoji_marker(out, out_len, &o, EMOJI_FLAG_NL)) break;
-            i += sizeof(nl_flag_surrogate_utf8) - 1;
+        size_t   start     = i;
+        size_t   cluster_i = i;
+        uint16_t idx;
+        if (read_emoji_cluster_index(in, &cluster_i, &idx)) {
+            if (!append_emoji_marker(out, out_len, &o, idx)) break;
+            i = cluster_i;
             continue;
         }
 
-        size_t   start = i;
         uint32_t cp;
         read_next_text_codepoint(in, &i, &cp);
 
-        if (cp == 0x1F3F4) {
-            uint8_t tag_marker;
-            if (try_parse_tag_flag(in, &i, &tag_marker)) {
-                if (!append_emoji_marker(out, out_len, &o, tag_marker)) break;
-                continue;
-            }
-        }
-
-        if (cp >= 0x1F1E6 && cp <= 0x1F1FF) {
-            size_t   next_i = i;
-            skip_emoji_joiners(in, &next_i);
-            uint32_t next_cp;
-            read_next_text_codepoint(in, &next_i, &next_cp);
-            if (next_cp >= 0x1F1E6 && next_cp <= 0x1F1FF) {
-                char first  = (char)('A' + (cp - 0x1F1E6));
-                char second = (char)('A' + (next_cp - 0x1F1E6));
-                if (!append_flag_pair_marker(out, out_len, &o, first, second)) break;
-                i = next_i;
-                continue;
-            }
-            if (!append_emoji_marker(out, out_len, &o, EMOJI_FLAG_GENERIC)) break;
-            continue;
-        }
-
-        uint8_t  marker = emoji_marker(cp);
-        if (cp == 0x1F1F3) {
-            size_t   next_i = i;
-            uint32_t next_cp = utf8_next_codepoint(in, &next_i);
-            uint32_t decoded_next_cp;
-            if (try_decode_utf16_surrogate_pair(in, &next_i, next_cp, &decoded_next_cp)) {
-                next_cp = decoded_next_cp;
-            }
-            if (next_cp == 0x1F1F1) {
-                marker = EMOJI_FLAG_NL;
-                i      = next_i;
-            }
-        }
-        if (marker != 0) {
-            if (!append_emoji_marker(out, out_len, &o, marker)) break;
-        } else if (cp == 0xFE0F || cp == 0x200D || (cp >= 0x1F3FB && cp <= 0x1F3FF)) {
+        if (cp == 0xFE0F || cp == 0x200D || (cp >= 0x1F3FB && cp <= 0x1F3FF)) {
             continue;
         } else if (cp >= 0x1F000) {
             if (debug_status) {
@@ -1076,7 +1026,7 @@ static void text_with_emoji_markers(const char *in, char *out, size_t out_len) {
                 if (o + len + 1 >= out_len) break;
                 memcpy(out + o, code, len + 1);
                 o += len;
-            } else if (!append_emoji_marker(out, out_len, &o, EMOJI_GENERIC)) {
+            } else if (!append_emoji_marker(out, out_len, &o, EMOJI_IDX_PLACEHOLDER)) {
                 break;
             }
         } else {
@@ -1113,221 +1063,6 @@ static bool ensure_sd_mounted(void) {
 
     ESP_LOGI(TAG, "SD card mounted for emoji assets");
     g_sd_mounted = true;
-    return true;
-}
-
-typedef struct {
-    uint8_t     marker;
-    const char *name;
-} emoji_asset_name_t;
-
-static const emoji_asset_name_t EMOJI_ASSET_NAMES[] = {
-    {EMOJI_SMILE, "smile"}, {EMOJI_GRIN, "grin"}, {EMOJI_JOY, "joy"},
-    {EMOJI_HEART_EYES, "heart_eyes"}, {EMOJI_COOL, "cool"}, {EMOJI_CRY, "cry"},
-    {EMOJI_THINKING, "thinking"}, {EMOJI_THUMBS_UP, "thumbs_up"}, {EMOJI_THUMBS_DOWN, "thumbs_down"},
-    {EMOJI_WAVE, "wave"}, {EMOJI_PRAY, "pray"}, {EMOJI_HEART, "heart"},
-    {EMOJI_FIRE, "fire"}, {EMOJI_PARTY, "party"}, {EMOJI_ROCKET, "rocket"},
-    {EMOJI_STAR, "star"}, {EMOJI_CHECK, "check"}, {EMOJI_CROSS, "cross"},
-    {EMOJI_HUNDRED, "hundred"}, {EMOJI_EYES, "eyes"}, {EMOJI_ANGRY, "angry"},
-    {EMOJI_SKULL, "skull"}, {EMOJI_SUN, "sun"}, {EMOJI_MOON, "moon"},
-    {EMOJI_BOLT, "bolt"}, {EMOJI_GIFT, "gift"}, {EMOJI_MUSIC, "music"},
-    {EMOJI_PIZZA, "pizza"}, {EMOJI_COFFEE, "coffee"}, {EMOJI_WINK, "wink"},
-    {EMOJI_BLUSH, "blush"}, {EMOJI_KISS, "kiss"}, {EMOJI_HEART_HANDS, "heart_hands"},
-    {EMOJI_STRONG, "strong"}, {EMOJI_CLAP, "clap"}, {EMOJI_SOB, "sob"},
-    {EMOJI_ROFL, "rofl"}, {EMOJI_MELTING, "melting"}, {EMOJI_PLEADING, "pleading"},
-    {EMOJI_NEUTRAL, "neutral"}, {EMOJI_UNAMUSED, "unamused"}, {EMOJI_SWEAT_SMILE, "sweat_smile"},
-    {EMOJI_RELIEVED, "relieved"}, {EMOJI_SLEEPING, "sleeping"}, {EMOJI_FLUSHED, "flushed"},
-    {EMOJI_SCREAM, "scream"}, {EMOJI_MIND_BLOWN, "mind_blown"}, {EMOJI_SMIRK, "smirk"},
-    {EMOJI_ZANY, "zany"}, {EMOJI_PARTY_FACE, "party_face"}, {EMOJI_HUGGING, "hugging"},
-    {EMOJI_SHUSHING, "shushing"}, {EMOJI_FACEPALM, "facepalm"}, {EMOJI_SHRUG, "shrug"},
-    {EMOJI_OK_HAND, "ok_hand"}, {EMOJI_RAISED_HANDS, "raised_hands"}, {EMOJI_POINT_RIGHT, "point_right"},
-    {EMOJI_POINT_LEFT, "point_left"}, {EMOJI_POINT_UP, "point_up"}, {EMOJI_POINT_DOWN, "point_down"},
-    {EMOJI_HANDSHAKE, "handshake"}, {EMOJI_ORANGE_HEART, "orange_heart"}, {EMOJI_YELLOW_HEART, "yellow_heart"},
-    {EMOJI_GREEN_HEART, "green_heart"}, {EMOJI_BLUE_HEART, "blue_heart"}, {EMOJI_PURPLE_HEART, "purple_heart"},
-    {EMOJI_BLACK_HEART, "black_heart"}, {EMOJI_BROKEN_HEART, "broken_heart"}, {EMOJI_SPARKLES, "sparkles"},
-    {EMOJI_POOP, "poop"}, {EMOJI_BOOM, "boom"}, {EMOJI_DROPS, "drops"},
-    {EMOJI_ZZZ, "zzz"}, {EMOJI_DASH, "dash"}, {EMOJI_MONKEY_SEE, "monkey_see"},
-    {EMOJI_CAT_SMILE, "cat_smile"}, {EMOJI_DOG, "dog"}, {EMOJI_CAT, "cat"},
-    {EMOJI_BEER, "beer"}, {EMOJI_WINE, "wine"}, {EMOJI_BURGER, "burger"},
-    {EMOJI_FRIES, "fries"}, {EMOJI_CAKE, "cake"}, {EMOJI_SOCCER, "soccer"},
-    {EMOJI_GAME, "game"}, {EMOJI_PHONE, "phone"}, {EMOJI_LAPTOP, "laptop"},
-    {EMOJI_BULB, "bulb"}, {EMOJI_MONEY, "money"}, {EMOJI_GEM, "gem"},
-    {EMOJI_WARNING, "warning"}, {EMOJI_QUESTION, "question"}, {EMOJI_EXCLAMATION, "exclamation"},
-    {EMOJI_CALENDAR, "calendar"}, {EMOJI_CLOCK, "clock"}, {EMOJI_HOME, "home"},
-    {EMOJI_CAR, "car"}, {EMOJI_TRAIN, "train"}, {EMOJI_AIRPLANE, "airplane"},
-    {EMOJI_GLOBE, "globe"}, {EMOJI_FLAG_NL, "flag_nl"}, {EMOJI_RAINBOW, "rainbow"},
-    {EMOJI_SNOWFLAKE, "snowflake"}, {EMOJI_UMBRELLA, "umbrella"}, {EMOJI_CLOUD, "cloud"},
-    {EMOJI_LOCK, "lock"}, {EMOJI_KEY, "key"}, {EMOJI_GEAR, "gear"},
-    {EMOJI_MAGNIFY, "magnify"}, {EMOJI_BELL, "bell"}, {EMOJI_PIN, "pin"},
-};
-
-static const char *emoji_asset_name(uint8_t marker) {
-    for (int i = 0; i < (int)(sizeof(EMOJI_ASSET_NAMES) / sizeof(EMOJI_ASSET_NAMES[0])); i++) {
-        if (EMOJI_ASSET_NAMES[i].marker == marker) return EMOJI_ASSET_NAMES[i].name;
-    }
-    return "generic";
-}
-
-static bool load_emoji_asset_file(emoji_asset_t *asset, const char *path, pax_buf_type_t type, size_t bytes_per_pixel) {
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) return false;
-
-    const size_t byte_count = EMOJI_ASSET_SIZE * EMOJI_ASSET_SIZE * bytes_per_pixel;
-    void        *pixels     = heap_caps_malloc(byte_count, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (pixels == NULL) {
-        fclose(file);
-        return false;
-    }
-
-    size_t got = fread(pixels, 1, byte_count, file);
-    fclose(file);
-    if (got != byte_count) {
-        free(pixels);
-        return false;
-    }
-
-    if (asset->loaded) {
-        pax_buf_destroy(&asset->image);
-    }
-    free(asset->pixels);
-    memset(&asset->image, 0, sizeof(asset->image));
-    if (!pax_buf_init(&asset->image, pixels, EMOJI_ASSET_SIZE, EMOJI_ASSET_SIZE, type)) {
-        free(pixels);
-        asset->pixels = NULL;
-        return false;
-    }
-    asset->pixels = pixels;
-    asset->loaded = true;
-    asset->failed = false;
-    return true;
-}
-
-static bool load_emoji_asset_pack_entry(emoji_asset_t *asset, const char *pack_path, const char *name) {
-    FILE *file = fopen(pack_path, "rb");
-    if (file == NULL) return false;
-
-    uint32_t magic = 0;
-    uint32_t count = 0;
-    if (fread(&magic, 1, sizeof(magic), file) != sizeof(magic) ||
-        fread(&count, 1, sizeof(count), file) != sizeof(count) ||
-        magic != EMOJI_PACK_MAGIC || count > 512) {
-        fclose(file);
-        return false;
-    }
-
-    const size_t byte_count = EMOJI_ASSET_SIZE * EMOJI_ASSET_SIZE * 4;
-    for (uint32_t i = 0; i < count; i++) {
-        char entry_name[EMOJI_PACK_ENTRY_NAME_LEN];
-        if (fread(entry_name, 1, sizeof(entry_name), file) != sizeof(entry_name)) break;
-        entry_name[sizeof(entry_name) - 1] = '\0';
-        if (strcmp(entry_name, name) != 0) {
-            fseek(file, (long)byte_count, SEEK_CUR);
-            continue;
-        }
-
-        void *pixels = heap_caps_malloc(byte_count, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (pixels == NULL) {
-            fclose(file);
-            return false;
-        }
-        size_t got = fread(pixels, 1, byte_count, file);
-        fclose(file);
-        if (got != byte_count) {
-            free(pixels);
-            return false;
-        }
-
-        if (asset->loaded) {
-            pax_buf_destroy(&asset->image);
-        }
-        free(asset->pixels);
-        memset(&asset->image, 0, sizeof(asset->image));
-        if (!pax_buf_init(&asset->image, pixels, EMOJI_ASSET_SIZE, EMOJI_ASSET_SIZE, PAX_BUF_32_8888ARGB)) {
-            free(pixels);
-            asset->pixels = NULL;
-            return false;
-        }
-        asset->pixels = pixels;
-        asset->loaded = true;
-        asset->failed = false;
-        return true;
-    }
-
-    fclose(file);
-    return false;
-}
-
-static emoji_asset_t *get_emoji_asset(uint8_t marker) {
-    for (int i = 0; i < EMOJI_ASSET_CACHE; i++) {
-        if (g_emoji_assets[i].marker == marker) {
-            g_emoji_assets[i].last_used = ++g_emoji_asset_tick;
-            return &g_emoji_assets[i];
-        }
-    }
-
-    int slot = -1;
-    for (int i = 0; i < EMOJI_ASSET_CACHE; i++) {
-        if (g_emoji_assets[i].marker == 0) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot < 0) {
-        uint32_t oldest = UINT32_MAX;
-        for (int i = 0; i < EMOJI_ASSET_CACHE; i++) {
-            if (g_emoji_assets[i].last_used < oldest) {
-                oldest = g_emoji_assets[i].last_used;
-                slot   = i;
-            }
-        }
-    }
-
-    emoji_asset_t *asset = &g_emoji_assets[slot];
-    if (asset->loaded) {
-        pax_buf_destroy(&asset->image);
-    }
-    free(asset->pixels);
-    memset(asset, 0, sizeof(*asset));
-    asset->marker    = marker;
-    asset->last_used = ++g_emoji_asset_tick;
-    return asset;
-}
-
-static bool load_emoji_asset_from_dir(emoji_asset_t *asset, uint8_t marker, const char *emoji_dir) {
-    char path[96];
-    snprintf(path, sizeof(path), "%s/%s.argb8888", emoji_dir, emoji_asset_name(marker));
-    if (load_emoji_asset_file(asset, path, PAX_BUF_32_8888ARGB, 4)) return true;
-    snprintf(path, sizeof(path), "%s/%02u.argb8888", emoji_dir, marker);
-    if (load_emoji_asset_file(asset, path, PAX_BUF_32_8888ARGB, 4)) return true;
-    snprintf(path, sizeof(path), "%s/%s.rgb565", emoji_dir, emoji_asset_name(marker));
-    if (load_emoji_asset_file(asset, path, PAX_BUF_16_565RGB, 2)) return true;
-    snprintf(path, sizeof(path), "%s/%02u.rgb565", emoji_dir, marker);
-    return load_emoji_asset_file(asset, path, PAX_BUF_16_565RGB, 2);
-}
-
-static bool try_draw_sd_emoji(uint8_t marker, float x, float y, float s) {
-    emoji_asset_t *asset = get_emoji_asset(marker);
-    if (asset == NULL || asset->failed) return false;
-    if (!asset->loaded) {
-        const char *name = emoji_asset_name(marker);
-        if (!load_emoji_asset_pack_entry(asset, "/sd/apps/" APP_REPOSITORY_SLUG "/emoji.pak", name) &&
-            !load_emoji_asset_pack_entry(asset, "/sd/matrixmatsu/emoji.pak", name) &&
-            !load_emoji_asset_from_dir(asset, marker, "/sd/apps/" APP_REPOSITORY_SLUG) &&
-            !load_emoji_asset_from_dir(asset, marker, "/sd/apps/" APP_REPOSITORY_SLUG "/emoji") &&
-            !load_emoji_asset_from_dir(asset, marker, "/sd/matrixmatsu/emoji")) {
-            if (!ensure_sd_mounted() ||
-                (!load_emoji_asset_pack_entry(asset, "/sd/apps/" APP_REPOSITORY_SLUG "/emoji.pak", name) &&
-                 !load_emoji_asset_pack_entry(asset, "/sd/matrixmatsu/emoji.pak", name) &&
-                 !load_emoji_asset_from_dir(asset, marker, "/sd/apps/" APP_REPOSITORY_SLUG) &&
-                 !load_emoji_asset_from_dir(asset, marker, "/sd/apps/" APP_REPOSITORY_SLUG "/emoji") &&
-                 !load_emoji_asset_from_dir(asset, marker, "/sd/matrixmatsu/emoji"))) {
-                asset->failed = true;
-                return false;
-            }
-        }
-    }
-
-    pax_draw_image_sized(&fb, &asset->image, x, y, s, s);
     return true;
 }
 
@@ -1373,7 +1108,7 @@ static bool load_named_emoji_asset_pack_entry(emoji_named_asset_t *asset, const 
     uint32_t count = 0;
     if (fread(&magic, 1, sizeof(magic), file) != sizeof(magic) ||
         fread(&count, 1, sizeof(count), file) != sizeof(count) ||
-        magic != EMOJI_PACK_MAGIC || count > 512) {
+        magic != EMOJI_PACK_MAGIC || count > 4096) {
         fclose(file);
         return false;
     }
@@ -1464,7 +1199,43 @@ static bool load_named_emoji_asset_from_dir(emoji_named_asset_t *asset, const ch
     return load_named_emoji_asset_file(asset, path, PAX_BUF_16_565RGB, 2);
 }
 
+// Logs, once, exactly which emoji.pak path (if any) was found and how many
+// entries it reports, so a device log makes SD/pack problems obvious without
+// spamming a line per emoji.
+static void log_emoji_pack_diagnostics_once(void) {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+
+    if (!ensure_sd_mounted()) {
+        ESP_LOGW(TAG, "emoji.pak check: SD card did not mount");
+        return;
+    }
+
+    static const char *const candidates[] = {
+        "/sd/apps/" APP_REPOSITORY_SLUG "/emoji.pak",
+        "/sd/matrixmatsu/emoji.pak",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        FILE *file = fopen(candidates[i], "rb");
+        if (file == NULL) {
+            ESP_LOGW(TAG, "emoji.pak not found at %s", candidates[i]);
+            continue;
+        }
+        uint32_t magic = 0, count = 0;
+        bool     ok = fread(&magic, 1, sizeof(magic), file) == sizeof(magic) &&
+                      fread(&count, 1, sizeof(count), file) == sizeof(count);
+        fclose(file);
+        if (!ok || magic != EMOJI_PACK_MAGIC) {
+            ESP_LOGW(TAG, "emoji.pak at %s has bad header (magic ok=%d)", candidates[i], ok && magic == EMOJI_PACK_MAGIC);
+        } else {
+            ESP_LOGI(TAG, "emoji.pak at %s has %" PRIu32 " entries", candidates[i], count);
+        }
+    }
+}
+
 static bool try_draw_sd_named_emoji(const char *name, float x, float y, float s) {
+    log_emoji_pack_diagnostics_once();
     emoji_named_asset_t *asset = get_named_emoji_asset(name);
     if (asset == NULL || asset->failed) return false;
     if (!asset->loaded) {
@@ -1480,6 +1251,7 @@ static bool try_draw_sd_named_emoji(const char *name, float x, float y, float s)
                  !load_named_emoji_asset_from_dir(asset, name, "/sd/apps/" APP_REPOSITORY_SLUG "/emoji") &&
                  !load_named_emoji_asset_from_dir(asset, name, "/sd/matrixmatsu/emoji"))) {
                 asset->failed = true;
+                ESP_LOGW(TAG, "emoji asset '%s' not found on SD (pack entry missing and no loose file)", name);
                 return false;
             }
         }
@@ -1580,15 +1352,9 @@ static void draw_eu_flag(float x, float y, float s) {
     pax_outline_rect(&fb, 0xFF202020, fx, fy, flag_w, flag_h);
 }
 
+// Offline (no SD asset) fallback for country flags: draw_emoji() already tried
+// the real flag asset by its codepoint key before falling back here.
 static void draw_flag_pair(char first, char second, float x, float y, float s) {
-    if (first >= 'A' && first <= 'Z' && second >= 'A' && second <= 'Z') {
-        char asset_name[8];
-        snprintf(asset_name, sizeof(asset_name), "flag_%c%c", (char)(first + ('a' - 'A')), (char)(second + ('a' - 'A')));
-        if (try_draw_sd_named_emoji(asset_name, x, y, s)) {
-            return;
-        }
-    }
-
     if (first == 'N' && second == 'L') {
         draw_nl_flag(x, y, s);
         return;
@@ -1603,22 +1369,10 @@ static void draw_flag_pair(char first, char second, float x, float y, float s) {
     pax_draw_text(&fb, 0xFF101010, pax_font_sky_mono, s * 0.28f, x + s * 0.23f, y + s * 0.36f, label);
 }
 
-static void draw_emoji_icon(uint8_t marker, float x, float y, float s) {
-    if (marker == EMOJI_FLAG_NL) {
-        draw_nl_flag(x, y, s);
-        return;
-    }
-    if (marker == EMOJI_FLAG_EU) {
-        draw_eu_flag(x, y, s);
-        return;
-    }
-    if (marker == EMOJI_FLAG_GENERIC) {
-        draw_generic_flag(x, y, s);
-        return;
-    }
-
-    if (try_draw_sd_emoji(marker, x, y, s)) return;
-
+// Offline (no SD asset) fallback hand-drawn icon set: draw_emoji() already tried
+// the real SD asset for `marker`'s concept before falling back here. Covers only
+// the original ~110 concepts; anything else falls back to draw_emoji_placeholder.
+static void draw_emoji_icon_legacy(uint8_t marker, float x, float y, float s) {
     pax_col_t dark = 0xFF2A1A00;
     switch (marker) {
         case EMOJI_GENERIC:
@@ -1776,6 +1530,65 @@ static void draw_emoji_icon(uint8_t marker, float x, float y, float s) {
     }
 }
 
+// Neutral "unrecognized emoji" box: shown when an EMOJI_TABLE entry has no SD
+// asset available (no SD card / not synced) and no legacy hand-drawn icon.
+static void draw_emoji_placeholder(float x, float y, float s) {
+    pax_draw_round_rect(&fb, 0xFF3A3A3A, x, y, s, s, s * 0.14f);
+    pax_outline_round_rect(&fb, TERM_DIM, x, y, s, s, s * 0.14f);
+}
+
+// A key like "1f1f3-1f1f1" is a two-letter country flag: decode the two
+// regional-indicator codepoints back into ASCII letters for draw_flag_pair().
+static bool key_is_flag_pair(const char *key, char *out_first, char *out_second) {
+    unsigned int a = 0, b = 0;
+    if (sscanf(key, "%x-%x", &a, &b) != 2) return false;
+    if (a < 0x1F1E6 || a > 0x1F1FF || b < 0x1F1E6 || b > 0x1F1FF) return false;
+    *out_first  = (char)('A' + (a - 0x1F1E6));
+    *out_second = (char)('A' + (b - 0x1F1E6));
+    return true;
+}
+
+// If `key` is a single codepoint that was part of the original hand-drawn icon
+// set, returns its legacy marker (for draw_emoji_icon_legacy); otherwise 0.
+static uint8_t legacy_marker_for_key(const char *key) {
+    if (strchr(key, '-') != NULL) return 0;
+    unsigned int cp = 0;
+    if (sscanf(key, "%x", &cp) != 1) return 0;
+    return emoji_marker(cp);
+}
+
+// The single entry point for drawing any emoji by its EMOJI_TABLE key: real SD
+// asset first, then a hand-drawn fallback (flag or legacy icon), then a plain
+// placeholder box.
+static void draw_emoji(const char *key, float x, float y, float s) {
+    if (try_draw_sd_named_emoji(key, x, y, s)) return;
+
+    char first, second;
+    if (key_is_flag_pair(key, &first, &second)) {
+        draw_flag_pair(first, second, x, y, s);
+        return;
+    }
+
+    uint8_t legacy = legacy_marker_for_key(key);
+    if (legacy != 0) {
+        draw_emoji_icon_legacy(legacy, x, y, s);
+        return;
+    }
+
+    draw_emoji_placeholder(x, y, s);
+}
+
+static void draw_emoji_by_index(uint16_t index, float x, float y, float s) {
+    if (index == EMOJI_IDX_FLAG_NL) { draw_nl_flag(x, y, s); return; }
+    if (index == EMOJI_IDX_FLAG_EU) { draw_eu_flag(x, y, s); return; }
+    if (index == EMOJI_IDX_FLAG_GENERIC) { draw_generic_flag(x, y, s); return; }
+    if (index == EMOJI_IDX_PLACEHOLDER || index >= EMOJI_TABLE_COUNT) {
+        draw_emoji_placeholder(x, y, s);
+        return;
+    }
+    draw_emoji(EMOJI_TABLE[index].key, x, y, s);
+}
+
 static void draw_text_with_emoji(pax_col_t color, float x, float y, const char *text) {
     char  segment[WRAP_LINE_LEN];
     int   seg_len = 0;
@@ -1787,29 +1600,17 @@ static void draw_text_with_emoji(pax_col_t color, float x, float y, const char *
     for (size_t i = 0; text != NULL && text[i] != '\0'; i++) {
         unsigned char ch = (unsigned char)text[i];
         if (is_emoji_marker(ch)) {
-            uint8_t marker = ch;
-            char flag_first = '\0';
-            char flag_second = '\0';
-            if (ch == EMOJI_EXT) {
-                if (text[i + 1] == '\0') break;
-                marker = (uint8_t)text[++i];
-                if (marker == EMOJI_FLAG_PAIR) {
-                    if (text[i + 1] == '\0' || text[i + 2] == '\0') break;
-                    flag_first  = text[++i];
-                    flag_second = text[++i];
-                }
-            }
+            if (text[i + 1] == '\0' || text[i + 2] == '\0') break;
+            uint16_t index = emoji_decode_index((unsigned char)text[i + 1], (unsigned char)text[i + 2]);
+            i += 2;
+
             if (seg_len > 0) {
                 segment[seg_len] = '\0';
                 pax_draw_text(&fb, color, pax_font_sky_mono, FONT_SIZE, cursor, y, segment);
                 cursor += pax_text_size(pax_font_sky_mono, FONT_SIZE, segment).x;
                 seg_len = 0;
             }
-            if (marker == EMOJI_FLAG_PAIR) {
-                draw_flag_pair(flag_first, flag_second, cursor, y + (g_line_h - icon_s) * 0.28f, icon_s);
-            } else {
-                draw_emoji_icon(marker, cursor, y + (g_line_h - icon_s) * 0.28f, icon_s);
-            }
+            draw_emoji_by_index(index, cursor, y + (g_line_h - icon_s) * 0.28f, icon_s);
             cursor += icon_s + 3.0f;
         } else {
             if (seg_len < (int)sizeof(segment) - 1) {
@@ -2753,31 +2554,89 @@ static void render_chat_input_only(void) {
 /* Emoji picker                                                                */
 /* -------------------------------------------------------------------------- */
 
+// Recomputes emoji_filtered[]/emoji_filtered_count from emoji_search + emoji_category
+// and resets the selection to the top-left cell.
+static void emoji_picker_refresh_filter(void) {
+    char needle[24];
+    size_t ni = 0;
+    for (const char *p = emoji_search; *p != '\0' && ni < sizeof(needle) - 1; p++, ni++) {
+        char c    = *p;
+        needle[ni] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    needle[ni] = '\0';
+
+    emoji_filtered_count = 0;
+    for (int i = 0; i < EMOJI_TABLE_COUNT; i++) {
+        if (emoji_category >= 0 && EMOJI_TABLE[i].group != (uint8_t)emoji_category) continue;
+        if (needle[0] != '\0') {
+            char   label_lower[40];
+            size_t li = 0;
+            for (const char *p = EMOJI_TABLE[i].label; *p != '\0' && li < sizeof(label_lower) - 1; p++, li++) {
+                char c          = *p;
+                label_lower[li] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+            }
+            label_lower[li] = '\0';
+            if (strstr(label_lower, needle) == NULL) continue;
+        }
+        emoji_filtered[emoji_filtered_count++] = i;
+    }
+    emoji_selected = 0;
+    emoji_scroll   = 0;
+}
+
 static bool handle_input_emoji_picker(bsp_input_event_t *event) {
+    const int cols = EMOJI_PICKER_COLS;
+
+    if (event->type == INPUT_EVENT_TYPE_KEYBOARD) {
+        char ascii = event->args_keyboard.ascii;
+        if (ascii == '\r' || ascii == '\n' || ascii == '\t') return false;
+        if (ascii == '\b') {
+            truncate_utf8_last(emoji_search);
+            emoji_picker_refresh_filter();
+            return true;
+        }
+        if ((unsigned char)ascii >= 0x20 || (event->args_keyboard.utf8 != NULL && event->args_keyboard.utf8[0] != '\0')) {
+            append_keyboard_text(emoji_search, sizeof(emoji_search), event);
+            emoji_picker_refresh_filter();
+            return true;
+        }
+        return false;
+    }
+
     if (event->type != INPUT_EVENT_TYPE_NAVIGATION || !event->args_navigation.state) return false;
 
-    const int cols = EMOJI_PICKER_COLS;
     switch (event->args_navigation.key) {
         case BSP_INPUT_NAVIGATION_KEY_UP:
             if (emoji_selected >= cols) emoji_selected -= cols;
             return true;
         case BSP_INPUT_NAVIGATION_KEY_DOWN:
-            if (emoji_selected + cols < EMOJI_CHOICE_COUNT) emoji_selected += cols;
-            else emoji_selected = EMOJI_CHOICE_COUNT - 1;
+            if (emoji_selected + cols < emoji_filtered_count) emoji_selected += cols;
+            else if (emoji_filtered_count > 0) emoji_selected = emoji_filtered_count - 1;
             return true;
         case BSP_INPUT_NAVIGATION_KEY_LEFT:
             if (emoji_selected > 0) emoji_selected--;
             return true;
         case BSP_INPUT_NAVIGATION_KEY_RIGHT:
-            if (emoji_selected < EMOJI_CHOICE_COUNT - 1) emoji_selected++;
+            if (emoji_selected < emoji_filtered_count - 1) emoji_selected++;
+            return true;
+        case BSP_INPUT_NAVIGATION_KEY_TAB:
+            emoji_category++;
+            if (emoji_category >= EMOJI_GROUP_COUNT) emoji_category = -1;
+            emoji_search[0] = '\0';
+            emoji_picker_refresh_filter();
+            return true;
+        case BSP_INPUT_NAVIGATION_KEY_BACKSPACE:
+            truncate_utf8_last(emoji_search);
+            emoji_picker_refresh_filter();
             return true;
         case BSP_INPUT_NAVIGATION_KEY_ESC:
         case BSP_INPUT_NAVIGATION_KEY_F3:
             screen = APP_SCREEN_CHAT;
             return true;
         case BSP_INPUT_NAVIGATION_KEY_RETURN:
-            if (emoji_selected >= 0 && emoji_selected < EMOJI_CHOICE_COUNT) {
-                append_text_piece(compose_buffer, sizeof(compose_buffer), EMOJI_CHOICES[emoji_selected].utf8);
+            if (emoji_selected >= 0 && emoji_selected < emoji_filtered_count) {
+                int idx = emoji_filtered[emoji_selected];
+                append_text_piece(compose_buffer, sizeof(compose_buffer), EMOJI_TABLE[idx].utf8);
             }
             screen = APP_SCREEN_CHAT;
             return true;
@@ -2801,8 +2660,20 @@ static void render_emoji_picker(void) {
     pax_simple_rect(&fb, BLACK, panel_x - 6, panel_y - 6, panel_w + 12, panel_h + 12);
     draw_box(panel_x, panel_y, panel_w, panel_h, TERM_GREEN, NULL);
 
+    char        header[64];
+    const char *group_name = emoji_category >= 0 ? EMOJI_GROUP_NAMES[emoji_category] : "All";
+    if (emoji_search[0] != '\0') {
+        snprintf(header, sizeof(header), "%s > \"%s\" (%d)", group_name, emoji_search, emoji_filtered_count);
+    } else {
+        snprintf(header, sizeof(header), "%s (%d) - type to search, TAB for category", group_name, emoji_filtered_count);
+    }
+    pax_draw_text(&fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE * 0.75f, panel_x + 10, panel_y + 6, header);
+
+    float grid_y = panel_y + g_line_h * 0.9f;
+    float grid_h = panel_h - g_line_h * 0.9f;
+
     int cols = EMOJI_PICKER_COLS;
-    int rows = (int)((panel_h - 14.0f) / (g_line_h * 1.35f));
+    int rows = (int)((grid_h - 14.0f) / (g_line_h * 1.35f));
     if (rows < 1) rows = 1;
     int visible = rows * cols;
     if (emoji_selected < emoji_scroll) emoji_scroll = (emoji_selected / cols) * cols;
@@ -2816,20 +2687,25 @@ static void render_emoji_picker(void) {
     if (icon_s > cell_h - 6.0f) icon_s = cell_h - 6.0f;
 
     for (int i = 0; i < visible; i++) {
-        int idx = emoji_scroll + i;
-        if (idx >= EMOJI_CHOICE_COUNT) break;
+        int pos = emoji_scroll + i;
+        if (pos >= emoji_filtered_count) break;
+        int idx = emoji_filtered[pos];
 
         int   col = i % cols;
         int   row = i / cols;
         float x   = panel_x + 12 + col * cell_w + (cell_w - icon_s) * 0.5f;
-        float y   = panel_y + 8 + row * cell_h + (cell_h - icon_s) * 0.5f;
+        float y   = grid_y + 8 + row * cell_h + (cell_h - icon_s) * 0.5f;
 
-        if (idx == emoji_selected) {
+        if (pos == emoji_selected) {
             pax_simple_rect(&fb, TERM_SELECT_BG, x - 5, y - 5, icon_s + 10, icon_s + 10);
             pax_outline_rect(&fb, TERM_GREEN, x - 5, y - 5, icon_s + 10, icon_s + 10);
         }
 
-        draw_emoji_icon(EMOJI_CHOICES[idx].marker, x, y, icon_s);
+        draw_emoji(EMOJI_TABLE[idx].key, x, y, icon_s);
+    }
+
+    if (emoji_filtered_count == 0) {
+        pax_draw_text(&fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, panel_x + 12, grid_y + 12, "no matches");
     }
     blit();
 }
@@ -3167,9 +3043,10 @@ static bool handle_global_hotkeys(bsp_input_event_t *event) {
             return true;
         case BSP_INPUT_NAVIGATION_KEY_F3:
             if (screen == APP_SCREEN_CHAT && !login_in_progress) {
-                emoji_selected = 0;
-                emoji_scroll   = 0;
-                screen         = APP_SCREEN_EMOJI_PICKER;
+                emoji_search[0] = '\0';
+                emoji_category  = -1;
+                emoji_picker_refresh_filter();
+                screen = APP_SCREEN_EMOJI_PICKER;
                 return true;
             }
             if (screen == APP_SCREEN_EMOJI_PICKER) {

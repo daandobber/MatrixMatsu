@@ -87,9 +87,13 @@ it unless `-NoStart` is passed.
 
 ## App Repository Package
 
-Regenerate emoji assets when needed:
+Regenerate emoji assets when needed (only re-run the `gen-emoji-*` steps if
+Unicode added new emoji since `tools/emoji-data.json` / `main/emoji_table.h`
+were last generated):
 
 ```powershell
+python tools\gen-emoji-data.py tools\emoji-test.txt tools\twemoji-filenames.txt tools\emoji-data.json
+python tools\gen-emoji-table.py tools\emoji-data.json main\emoji_table.h
 .\tools\make-emoji-assets.ps1
 .\tools\make-emoji-pack.ps1
 ```
@@ -109,6 +113,15 @@ dist/matrixmatsu-app-repository-package.zip
 
 ## Feature Context
 
+- Emoji: `main/emoji_table.h` (generated) holds ~1650 emoji (codepoint key, UTF-8
+  bytes, label, group). `text_with_emoji_markers()` in `main.c` recognizes any
+  emoji in incoming/outgoing text (ZWJ sequences, skin tones and gender/hair
+  variants are normalized down to the neutral entry) and encodes it as a 3-byte
+  inline marker; `draw_emoji()` resolves that back to an SD-loaded raster asset,
+  falling back to a small hand-drawn legacy icon set (~110 concepts) or a plain
+  placeholder box when no SD card/asset is available. The emoji picker
+  (`render_emoji_picker`) supports live search and TAB-cycled category filters
+  over the same table.
 - Audio messages are downloaded on demand from Matrix media and played locally.
 - Side volume buttons are used by the audio path.
 - Image messages are downloaded on demand and viewed through `image_viewer.c`.

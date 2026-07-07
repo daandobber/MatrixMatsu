@@ -43,7 +43,20 @@ By default this installs the app as `matrixmatsu` with the title `MatrixMatsu`.
 
 ## Emoji Assets
 
-Emoji assets are stored outside the application binary and loaded on demand. To regenerate them:
+MatrixMatsu recognizes and can send the full "default" (no skin tone, no gender,
+no hair style) Unicode emoji set, ~1650 emoji, sourced from
+[Twemoji](https://github.com/twitter/twemoji). Assets are stored outside the
+application binary (on the SD card) and loaded on demand, keyed by codepoint.
+
+`tools/emoji-data.json` and `main/emoji_table.h` are generated, checked-in data.
+Regenerate them only when Unicode adds new emoji:
+
+```powershell
+python tools\gen-emoji-data.py tools\emoji-test.txt tools\twemoji-filenames.txt tools\emoji-data.json
+python tools\gen-emoji-table.py tools\emoji-data.json main\emoji_table.h
+```
+
+Then (re)build the raster assets and pack them:
 
 ```powershell
 .\tools\make-emoji-assets.ps1

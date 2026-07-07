@@ -7,6 +7,11 @@ param(
     [switch]$NoStart
 )
 
+# Must match APP_REPOSITORY_SLUG in main/main.c: that's the path the firmware
+# actually looks for emoji.pak under on the SD card (/sd/apps/<slug>/), which is
+# a different namespace than the BadgeLink AppFS dev slug above.
+$AppRepositorySlug = "nl.daandobber.matrixmatsu"
+
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -91,6 +96,29 @@ Invoke-BadgeLink -Arguments @("appfs", "list")
 
 Write-Host "Uploading $AppBin as '$Slug'..."
 Invoke-BadgeLink -Arguments @("appfs", "upload", $Slug, $Title, "$Version", $AppBin) -FailurePatterns @("Out of FLASH space", "not found", "Disconnected", "Malformed")
+
+$EmojiPack = Join-Path $Root "emoji_assets\emoji.pak"
+$EmojiPackSdPath = "/sd/apps/$AppRepositorySlug/emoji.pak"
+if (Test-Path $EmojiPack) {
+    Write-Host "Uploading emoji.pak to SD card at ${EmojiPackSdPath}..."
+    try {
+        Invoke-BadgeLink -Arguments @("fs", "mkdir", "/sd/apps")
+    } catch {
+        Write-Host "  (mkdir /sd/apps failed, probably already exists)"
+    }
+    try {
+        Invoke-BadgeLink -Arguments @("fs", "mkdir", "/sd/apps/$AppRepositorySlug")
+    } catch {
+        Write-Host "  (mkdir /sd/apps/$AppRepositorySlug failed, probably already exists)"
+    }
+    try {
+        Invoke-BadgeLink -Arguments @("fs", "upload", $EmojiPackSdPath, $EmojiPack)
+    } catch {
+        Write-Warning "Failed to upload emoji.pak to the SD card: $_"
+    }
+} else {
+    Write-Host "No emoji_assets\emoji.pak found locally; skipping emoji asset upload. Run tools\make-emoji-assets.ps1 + tools\make-emoji-pack.ps1 first if you want emoji icons."
+}
 
 if (!$NoStart) {
     Write-Host "Starting '$Slug'..."
