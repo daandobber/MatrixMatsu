@@ -6,13 +6,17 @@ It is built for the Tanmatsu keyboard and small display, with a favorites-first 
 
 ## Status
 
-This is early software. It can log in to a Matrix homeserver, sync rooms, send plain text messages, show recent history, and display a compact emoji set.
+This is early software. It can log in to a Matrix homeserver, sync rooms, send
+plain text messages and the full default Unicode emoji set, show recent
+history, and play audio and image messages. Video messages (`m.video`) can
+also be played, but that path is still experimental and can be turned off in
+Settings if it causes playback issues.
 
 Known limitations:
 
 - encrypted rooms are shown but sending encrypted messages is not supported
 - history is cached per opened room, not mirrored for the whole account
-- emoji support is asset-backed and intentionally limited for device memory
+- video playback is experimental and may be slow or fail on some codecs/profiles
 
 ## Building
 

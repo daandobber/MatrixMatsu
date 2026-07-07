@@ -111,7 +111,7 @@ New-Icon 64 (Join-Path $outDir "icon64.png")
 $metadataJson = @"
 {
   "name": "MatrixMatsu",
-  "description": "Matrix chat client for Tanmatsu and Konsool",
+  "description": "Matrix chat client for Tanmatsu and Konsool (github.com/daandobber/MatrixMatsu)",
   "categories": [
     "communication"
   ],
