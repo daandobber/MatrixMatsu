@@ -108,31 +108,44 @@ New-Icon 16 (Join-Path $outDir "icon16.png")
 New-Icon 32 (Join-Path $outDir "icon32.png")
 New-Icon 64 (Join-Path $outDir "icon64.png")
 
-$metadata = [ordered]@{
-    name = "MatrixMatsu"
-    description = "Matrix chat client for Tanmatsu and Konsool"
-    categories = @("communication")
-    version = $Version
-    icon = [ordered]@{
-        "16x16" = "icon16.png"
-        "32x32" = "icon32.png"
-        "64x64" = "icon64.png"
-    }
-    author = "Daan Dobber"
-    license_type = "MIT"
-    license_file = "LICENSE"
-    application = @(
-        [ordered]@{
-            targets = @("tanmatsu", "konsool")
-            revision = $Revision
-            type = "appfs"
-            executable = "matrixmatsu.bin"
-            assets = @("emoji.pak")
+$metadataJson = @"
+{
+  "name": "MatrixMatsu",
+  "description": "Matrix chat client for Tanmatsu and Konsool",
+  "categories": [
+    "communication"
+  ],
+  "version": "$Version",
+  "icon": {
+    "16x16": "icon16.png",
+    "32x32": "icon32.png",
+    "64x64": "icon64.png"
+  },
+  "author": "Daan Dobber",
+  "license_type": "MIT",
+  "license_file": "LICENSE",
+  "application": [
+    {
+      "targets": [
+        "tanmatsu",
+        "konsool"
+      ],
+      "revision": $Revision,
+      "type": "appfs",
+      "executable": "matrixmatsu.bin",
+      "assets": [
+        {
+          "source_file": "emoji.pak",
+          "target_file": "emoji.pak"
         }
-    )
+      ]
+    }
+  ]
 }
+"@
 
-$metadata | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 (Join-Path $outDir "metadata.json")
+$metadataPath = Join-Path $outDir "metadata.json"
+[System.IO.File]::WriteAllText($metadataPath, $metadataJson + "`n", (New-Object System.Text.UTF8Encoding $false))
 
 $zipPath = ".\dist\matrixmatsu-app-repository-package.zip"
 Compress-Archive -Path $outDir -DestinationPath $zipPath -Force
