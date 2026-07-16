@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <ctype.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdlib.h>
@@ -13,7 +14,9 @@
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_types.h"
+#include "esp_lcd_mipi_dsi.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "freertos/task.h"
 #include "hal/lcd_types.h"
@@ -68,6 +71,10 @@ static pax_buf_t                  fb                   = {0};
 static QueueHandle_t              input_event_queue    = NULL;
 static float                      g_char_w             = 9.0f;
 static float                      g_line_h             = 20.0f;
+static void                      *g_display_buffers[2] = {NULL, NULL};
+static int                        g_display_draw_buffer = 0;
+static size_t                     g_display_buffer_size = 0;
+static SemaphoreHandle_t          g_display_te_semaphore = NULL;
 
 // Scratch buffers used only by render_chat(), allocated once from PSRAM.
 static char      (*g_all_lines)[WRAP_LINE_LEN] = NULL;
@@ -113,15 +120,19 @@ static int room_scroll   = 0;
 static bool room_list_show_all = false;
 static bool debug_status = false;
 static bool video_playback_enabled = true; // still experimental, see Settings
+static bool auto_capitalize_sentences = true;
 
 // Chat state
 static int  chat_room_index     = -1;
 static char chat_room_id[MATRIX_ROOM_ID_LEN] = "";
 static char compose_buffer[400] = "";
+static bool compose_redraw_pending = false;
+static int64_t compose_redraw_at_us = 0;
 static int  chat_scroll_offset  = 0;
 static int  chat_selected_message = -1;
 static int  emoji_selected      = 0;
 static int  emoji_scroll        = 0;
+static bool emoji_picker_drawn  = false;
 static pax_buf_t viewed_image = {0};
 static bool viewed_image_valid = false;
 static char viewed_image_label[MATRIX_BODY_LEN] = "";
@@ -142,15 +153,21 @@ typedef struct {
 // Menu/settings state
 static int menu_selected     = 0;
 static int settings_selected = 0;
+static int settings_scroll   = 0;
 static int theme_index       = 0;
 static int font_size_index   = 1;
 static char audio_volume_status[MATRIX_AUDIO_STATUS_LEN] = "";
+static bool g_chat_layout_valid = false;
+static int  g_chat_layout_total_lines = 0;
+static char g_chat_layout_title[192] = "";
+static bool g_chat_layout_room_encrypted = false;
 
 /* -------------------------------------------------------------------------- */
 /* Forward declarations                                                        */
 /* -------------------------------------------------------------------------- */
 
 static void blit(void);
+static void blit_rows(float y_start, float y_end);
 static void measure_font(void);
 static void draw_box(float x, float y, float w, float h, pax_col_t color, const char *title);
 static const char *matrix_state_text(matrix_state_t state);
@@ -175,14 +192,18 @@ static bool handle_input_video_player(bsp_input_event_t *event);
 static bool handle_input_emoji_picker(bsp_input_event_t *event);
 static bool handle_input_menu(bsp_input_event_t *event);
 static bool handle_input_settings(bsp_input_event_t *event);
+static bool dispatch_input_event(bsp_input_event_t *event);
 static void send_current_message(void);
+static void schedule_compose_redraw(void);
 
 static void render(void);
 static void render_login(void);
 static void render_room_list(void);
+static bool render_room_list_selection_only(int old_selection);
 static void render_chat_frame(bool do_blit);
 static void render_chat(void);
 static void render_chat_input_only(void);
+static bool render_chat_messages_only(void);
 static void render_image_viewer(void);
 static void render_video_player(void);
 static void render_emoji_picker(void);
@@ -194,10 +215,38 @@ static void render_settings(void);
 /* -------------------------------------------------------------------------- */
 
 static void blit(void) {
+    if (g_display_buffers[0] != NULL && g_display_buffers[1] != NULL && g_display_te_semaphore != NULL) {
+        while (xSemaphoreTake(g_display_te_semaphore, 0) == pdTRUE) {
+        }
+    }
     esp_err_t res = bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Failed to blit to display: %d", res);
+        return;
     }
+
+    if (g_display_buffers[0] != NULL && g_display_buffers[1] != NULL) {
+        // The DPI driver switches to the selected framebuffer on a frame
+        // boundary. Wait for that boundary before reusing the old frontbuffer.
+        if (g_display_te_semaphore != NULL) {
+            xSemaphoreTake(g_display_te_semaphore, pdMS_TO_TICKS(40));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(17));
+        }
+
+        int next = 1 - g_display_draw_buffer;
+        memcpy(g_display_buffers[next], g_display_buffers[g_display_draw_buffer], g_display_buffer_size);
+        g_display_draw_buffer = next;
+        fb.buf = g_display_buffers[g_display_draw_buffer];
+    }
+}
+
+// The Tanmatsu framebuffer is rotated in software. Its logical horizontal
+// bands are non-contiguous physically, so use a stable full-frame transfer.
+static void blit_rows(float y_start, float y_end) {
+    (void)y_start;
+    (void)y_end;
+    blit();
 }
 
 static void measure_font(void) {
@@ -1866,6 +1915,15 @@ static void truncate_utf8_last(char *text) {
     text[len] = '\0';
 }
 
+static void schedule_compose_redraw(void) {
+    if (!compose_redraw_pending) {
+        // Allow the scancode/keyboard event pair and a short typing burst to
+        // arrive, while keeping first-key latency below a visible threshold.
+        compose_redraw_at_us = esp_timer_get_time() + 30000;
+    }
+    compose_redraw_pending = true;
+}
+
 static void append_keyboard_text(char *text, size_t cap, bsp_input_event_t *event) {
     const char *piece = event->args_keyboard.utf8;
     char        ascii_piece[2];
@@ -1880,7 +1938,17 @@ static void append_keyboard_text(char *text, size_t cap, bsp_input_event_t *even
     size_t len       = strlen(text);
     size_t piece_len = strlen(piece);
     if (piece_len == 0 || len + piece_len >= cap) return;
+
+    bool sentence_start = true;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)text[i];
+        if (ch == '.' || ch == '!' || ch == '?' || ch == '\n') sentence_start = true;
+        else if (isalnum(ch)) sentence_start = false;
+    }
     memcpy(text + len, piece, piece_len + 1);
+    if (auto_capitalize_sentences && sentence_start && text[len] >= 'a' && text[len] <= 'z') {
+        text[len] = (char)(text[len] - 'a' + 'A');
+    }
 }
 
 static void append_text_piece(char *text, size_t cap, const char *piece) {
@@ -1927,6 +1995,10 @@ static void load_saved_account(void) {
     if (nvs_get_u8(nvs, "video_enabled", &video_enabled) == ESP_OK) {
         video_playback_enabled = video_enabled != 0;
     }
+    uint8_t auto_caps = 1;
+    if (nvs_get_u8(nvs, "auto_caps", &auto_caps) == ESP_OK) {
+        auto_capitalize_sentences = auto_caps != 0;
+    }
 
     if (remember_account) {
         size_t len = sizeof(login_homeserver);
@@ -1953,6 +2025,7 @@ static void save_account_settings(void) {
     nvs_set_u8(nvs, "show_all", room_list_show_all ? 1 : 0);
     nvs_set_u8(nvs, "debug_status", debug_status ? 1 : 0);
     nvs_set_u8(nvs, "video_enabled", video_playback_enabled ? 1 : 0);
+    nvs_set_u8(nvs, "auto_caps", auto_capitalize_sentences ? 1 : 0);
     nvs_set_i32(nvs, "theme", theme_index);
     nvs_set_i32(nvs, "font_size", font_size_index);
     if (remember_account) {
@@ -2183,6 +2256,65 @@ static int room_visible_to_actual_index_locked(int visible_index) {
     return -1;
 }
 
+static void draw_room_list_row_locked(int visible_idx, int row, float list_y, float w) {
+    int idx = room_visible_to_actual_index_locked(visible_idx);
+    matrix_room_t *room = matrix_get_room(idx);
+    if (room == NULL) return;
+
+    float     ry       = list_y + g_line_h * (row + 1);
+    bool      selected = visible_idx == room_selected;
+    pax_col_t color    = selected ? TERM_GREEN : TERM_FG;
+    if (selected) {
+        pax_simple_rect(&fb, TERM_SELECT_BG, 24, ry - 2, w - 64, g_line_h);
+    }
+    const char *name   = (room->has_name && room->name[0] != '\0') ? room->name : room->room_id;
+    const char *prefix = selected ? "> " : (room->unread ? "* " : "  ");
+    char display_name[128];
+    char line[160];
+    char unread_suffix[16] = "";
+    text_with_emoji_markers(name, display_name, sizeof(display_name));
+    if (room->unread_count > 0) {
+        snprintf(unread_suffix, sizeof(unread_suffix), " (%u)", (unsigned int)room->unread_count);
+    }
+    snprintf(line, sizeof(line), "%s%s%s %s%s", prefix, room->favorite ? "[*]" : "   ",
+             room->encrypted ? "[E]" : "   ", display_name, unread_suffix);
+    draw_text_with_emoji(color, 32, ry, line);
+}
+
+static bool render_room_list_selection_only(int old_selection) {
+    float w = pax_buf_get_widthf(&fb);
+    float h = pax_buf_get_heightf(&fb);
+    float list_y = 12 + g_line_h * 2.5f;
+    float list_h = h - list_y - (debug_status ? g_line_h * 2 : g_line_h * 0.5f);
+    int visible_rows = (int)((list_h - g_line_h) / g_line_h);
+    if (visible_rows < 1) visible_rows = 1;
+
+    int new_scroll = room_scroll;
+    if (room_selected < new_scroll) new_scroll = room_selected;
+    if (room_selected >= new_scroll + visible_rows) new_scroll = room_selected - visible_rows + 1;
+    if (new_scroll != room_scroll) return false;
+
+    int first_row = old_selection - room_scroll;
+    int second_row = room_selected - room_scroll;
+    if (first_row < 0 || first_row >= visible_rows || second_row < 0 || second_row >= visible_rows) return false;
+
+    matrix_lock();
+    float first_y = list_y + g_line_h * (first_row + 1);
+    pax_simple_rect(&fb, BLACK, 18, first_y - 2, w - 36, g_line_h);
+    draw_room_list_row_locked(old_selection, first_row, list_y, w);
+    float second_y = list_y + g_line_h * (second_row + 1);
+    if (second_row != first_row) {
+        pax_simple_rect(&fb, BLACK, 18, second_y - 2, w - 36, g_line_h);
+        draw_room_list_row_locked(room_selected, second_row, list_y, w);
+    }
+    matrix_unlock();
+
+    float y0 = first_y < second_y ? first_y : second_y;
+    float y1 = first_y > second_y ? first_y : second_y;
+    blit_rows(y0 - 2, y1 + g_line_h);
+    return true;
+}
+
 static bool handle_input_room_list(bsp_input_event_t *event) {
     if (event->type != INPUT_EVENT_TYPE_NAVIGATION || !event->args_navigation.state) return false;
 
@@ -2191,17 +2323,26 @@ static bool handle_input_room_list(bsp_input_event_t *event) {
     matrix_unlock();
     switch (event->args_navigation.key) {
         case BSP_INPUT_NAVIGATION_KEY_UP:
-            if (room_selected > 0) room_selected--;
-            return true;
+            if (room_selected > 0) {
+                int old_selection = room_selected;
+                room_selected--;
+                return !render_room_list_selection_only(old_selection);
+            }
+            return false;
         case BSP_INPUT_NAVIGATION_KEY_DOWN:
-            if (room_selected < count - 1) room_selected++;
-            return true;
+            if (room_selected < count - 1) {
+                int old_selection = room_selected;
+                room_selected++;
+                return !render_room_list_selection_only(old_selection);
+            }
+            return false;
         case BSP_INPUT_NAVIGATION_KEY_RETURN:
             if (count > 0) {
                 chat_room_id[0]    = '\0';
                 compose_buffer[0]  = '\0';
                 chat_scroll_offset = 0;
                 chat_selected_message = -1;
+                g_chat_layout_valid = false;
                 matrix_lock();
                 int actual_index = room_visible_to_actual_index_locked(room_selected);
                 chat_room_index = actual_index;
@@ -2260,27 +2401,7 @@ static void render_room_list(void) {
         for (int row = 0; row < visible_rows; row++) {
             int visible_idx = room_scroll + row;
             if (visible_idx >= count) break;
-            int idx = room_visible_to_actual_index_locked(visible_idx);
-            matrix_room_t *room = matrix_get_room(idx);
-            if (room == NULL) continue;
-
-            float     ry       = list_y + g_line_h * (row + 1);
-            bool      selected = (visible_idx == room_selected);
-            pax_col_t color    = selected ? TERM_GREEN : TERM_FG;
-            if (selected) {
-                pax_simple_rect(&fb, TERM_SELECT_BG, 24, ry - 2, w - 64, g_line_h);
-            }
-            const char *name   = (room->has_name && room->name[0] != '\0') ? room->name : room->room_id;
-            const char *prefix = selected ? "> " : (room->unread ? "* " : "  ");
-            char        display_name[128];
-            char        line[160];
-            char        unread_suffix[16] = "";
-            text_with_emoji_markers(name, display_name, sizeof(display_name));
-            if (room->unread_count > 0) {
-                snprintf(unread_suffix, sizeof(unread_suffix), " (%u)", (unsigned int)room->unread_count);
-            }
-            snprintf(line, sizeof(line), "%s%s%s %s%s", prefix, room->favorite ? "[*]" : "   ", room->encrypted ? "[E]" : "   ", display_name, unread_suffix);
-            draw_text_with_emoji(color, 32, ry, line);
+            draw_room_list_row_locked(visible_idx, row, list_y, w);
         }
     }
     matrix_unlock();
@@ -2483,11 +2604,13 @@ static bool handle_input_chat(bsp_input_event_t *event) {
                 screen = APP_SCREEN_ROOM_LIST;
                 return true;
             case BSP_INPUT_NAVIGATION_KEY_BACKSPACE: {
+                size_t old_len = strlen(compose_buffer);
                 truncate_utf8_last(compose_buffer);
-                render_chat_input_only();
+                if (strlen(compose_buffer) != old_len) schedule_compose_redraw();
                 return false;
             }
             case BSP_INPUT_NAVIGATION_KEY_UP: {
+                int old_selection = chat_selected_message;
                 matrix_lock();
                 int room_index = matrix_find_room_index_by_id(chat_room_id);
                 matrix_room_t *room = matrix_get_room(room_index);
@@ -2497,9 +2620,11 @@ static bool handle_input_chat(bsp_input_event_t *event) {
                     else if (chat_selected_message > 0) chat_selected_message--;
                 }
                 matrix_unlock();
-                return true;
+                if (chat_selected_message == old_selection) return false;
+                return !render_chat_messages_only();
             }
             case BSP_INPUT_NAVIGATION_KEY_DOWN: {
+                int old_selection = chat_selected_message;
                 matrix_lock();
                 int room_index = matrix_find_room_index_by_id(chat_room_id);
                 matrix_room_t *room = matrix_get_room(room_index);
@@ -2509,9 +2634,11 @@ static bool handle_input_chat(bsp_input_event_t *event) {
                     else if (chat_selected_message < count - 1) chat_selected_message++;
                 }
                 matrix_unlock();
-                return true;
+                if (chat_selected_message == old_selection) return false;
+                return !render_chat_messages_only();
             }
-            case BSP_INPUT_NAVIGATION_KEY_PGUP:
+            case BSP_INPUT_NAVIGATION_KEY_PGUP: {
+                int old_selection = chat_selected_message;
                 matrix_lock();
                 {
                     int room_index = matrix_find_room_index_by_id(chat_room_id);
@@ -2524,8 +2651,11 @@ static bool handle_input_chat(bsp_input_event_t *event) {
                     }
                 }
                 matrix_unlock();
-                return true;
-            case BSP_INPUT_NAVIGATION_KEY_PGDN:
+                if (chat_selected_message == old_selection) return false;
+                return !render_chat_messages_only();
+            }
+            case BSP_INPUT_NAVIGATION_KEY_PGDN: {
+                int old_selection = chat_selected_message;
                 matrix_lock();
                 {
                     int room_index = matrix_find_room_index_by_id(chat_room_id);
@@ -2540,7 +2670,9 @@ static bool handle_input_chat(bsp_input_event_t *event) {
                     }
                 }
                 matrix_unlock();
-                return true;
+                if (chat_selected_message == old_selection) return false;
+                return !render_chat_messages_only();
+            }
             case BSP_INPUT_NAVIGATION_KEY_RETURN:
                 if (compose_buffer[0] != '\0') send_current_message();
                 else request_selected_media();
@@ -2561,8 +2693,9 @@ static bool handle_input_chat(bsp_input_event_t *event) {
             return true;
         }
         if ((unsigned char)ascii >= 0x20 || (event->args_keyboard.utf8 != NULL && event->args_keyboard.utf8[0] != '\0')) {
+            size_t old_len = strlen(compose_buffer);
             append_keyboard_text(compose_buffer, sizeof(compose_buffer), event);
-            render_chat_input_only();
+            if (strlen(compose_buffer) != old_len) schedule_compose_redraw();
             return false;
         }
     }
@@ -2570,6 +2703,7 @@ static bool handle_input_chat(bsp_input_event_t *event) {
 }
 
 static void render_chat_frame(bool do_blit) {
+    g_chat_layout_valid = false;
     pax_background(&fb, BLACK);
     float w = pax_buf_get_widthf(&fb);
     float h = pax_buf_get_heightf(&fb);
@@ -2666,6 +2800,11 @@ static void render_chat_frame(bool do_blit) {
     }
     matrix_unlock();
 
+    g_chat_layout_total_lines = total_lines;
+    snprintf(g_chat_layout_title, sizeof(g_chat_layout_title), "%s", title);
+    g_chat_layout_room_encrypted = room_encrypted;
+    g_chat_layout_valid = true;
+
     int visible_rows = (int)((messages_h - g_line_h * 1.25f) / g_line_h);
     if (visible_rows < 1) visible_rows = 1;
     int max_scroll = (total_lines > visible_rows) ? (total_lines - visible_rows) : 0;
@@ -2725,28 +2864,92 @@ static void render_chat(void) {
     render_chat_frame(true);
 }
 
+// Navigation does not change message text. Reuse the wrapped-line cache and
+// redraw only the message pane instead of rebuilding and transferring a frame.
+static bool render_chat_messages_only(void) {
+    if (!g_chat_layout_valid || g_all_lines == NULL || g_line_colors == NULL ||
+        g_line_name_colors == NULL || g_line_name_lens == NULL || g_line_message_indices == NULL) {
+        return false;
+    }
+
+    float w = pax_buf_get_widthf(&fb);
+    float h = pax_buf_get_heightf(&fb);
+    float messages_y = debug_status ? (12 + g_line_h * 2.5f) : (12 + g_line_h * 1.25f);
+    float input_h    = g_line_h * 4.2f;
+    float gap        = 8.0f;
+    float bottom_pad = 10.0f;
+    float messages_h = h - messages_y - input_h - gap - bottom_pad;
+
+    int visible_rows = (int)((messages_h - g_line_h * 1.25f) / g_line_h);
+    if (visible_rows < 1) visible_rows = 1;
+    int total_lines = g_chat_layout_total_lines;
+    int selected_line_start = -1;
+    int selected_line_end = -1;
+    for (int i = 0; i < total_lines; i++) {
+        if (g_line_message_indices[i] != chat_selected_message) continue;
+        if (selected_line_start < 0) selected_line_start = i;
+        selected_line_end = i;
+    }
+
+    if (selected_line_start >= 0) {
+        int visible_start = total_lines - chat_scroll_offset - visible_rows;
+        int visible_end   = total_lines - chat_scroll_offset - 1;
+        if (visible_start < 0) visible_start = 0;
+        if (selected_line_start < visible_start) {
+            chat_scroll_offset = total_lines - visible_rows - selected_line_start;
+        } else if (selected_line_end > visible_end) {
+            chat_scroll_offset = total_lines - selected_line_end - 1;
+        }
+    }
+    int max_scroll = total_lines > visible_rows ? total_lines - visible_rows : 0;
+    if (chat_scroll_offset < 0) chat_scroll_offset = 0;
+    if (chat_scroll_offset > max_scroll) chat_scroll_offset = max_scroll;
+
+    int end_line = total_lines - chat_scroll_offset;
+    int start_line = end_line - visible_rows;
+    if (start_line < 0) start_line = 0;
+
+    pax_simple_rect(&fb, BLACK, 0, messages_y - g_line_h, w, messages_h + g_line_h + 2);
+    draw_box(16, messages_y, w - 32, messages_h, TERM_GREEN, g_chat_layout_title);
+    float ty = messages_y + g_line_h;
+    for (int i = start_line; i < end_line; i++) {
+        bool selected = chat_selected_message >= 0 && g_line_message_indices[i] == chat_selected_message;
+        if (selected) {
+            pax_simple_rect(&fb, TERM_SELECT_BG, 24, ty - 2, w - 48, g_line_h);
+            pax_outline_rect(&fb, TERM_GREEN, 24, ty - 2, w - 48, g_line_h);
+        }
+        if (g_line_name_lens[i] > 0) {
+            char prefix[WRAP_LINE_LEN];
+            size_t prefix_len = g_line_name_lens[i];
+            if (prefix_len >= sizeof(prefix)) prefix_len = sizeof(prefix) - 1;
+            memcpy(prefix, g_all_lines[i], prefix_len);
+            prefix[prefix_len] = '\0';
+            pax_draw_text(&fb, g_line_name_colors[i], pax_font_sky_mono, FONT_SIZE, 28, ty, prefix);
+            float prefix_w = pax_text_size(pax_font_sky_mono, FONT_SIZE, prefix).x;
+            draw_text_with_emoji(g_line_colors[i], 28 + prefix_w, ty, g_all_lines[i] + prefix_len);
+        } else {
+            draw_text_with_emoji(g_line_colors[i], 28, ty, g_all_lines[i]);
+        }
+        ty += g_line_h;
+    }
+    blit_rows(messages_y - g_line_h, messages_y + messages_h + 2);
+    return true;
+}
+
 static void render_chat_input_only(void) {
     float w = pax_buf_get_widthf(&fb);
     float h = pax_buf_get_heightf(&fb);
 
-    float messages_y = 12 + g_line_h * 2.5f;
+    float messages_y = debug_status ? (12 + g_line_h * 2.5f) : (12 + g_line_h * 1.25f);
     float input_h    = g_line_h * 4.2f;
     float gap        = 8.0f;
     float bottom_pad = 10.0f;
     float messages_h = h - messages_y - input_h - gap - bottom_pad;
     float input_y    = messages_y + messages_h + gap;
 
-    bool room_encrypted = false;
-    matrix_lock();
-    int room_index = matrix_find_room_index_by_id(chat_room_id);
-    matrix_room_t *room = matrix_get_room(room_index);
-    room_encrypted = room ? room->encrypted : false;
-    chat_room_index = room_index;
-    matrix_unlock();
-
     pax_simple_rect(&fb, BLACK, 0, input_y - g_line_h, w, h - input_y + g_line_h);
-    draw_compose_box(16, input_y, w - 32, input_h, room_encrypted);
-    blit();
+    draw_compose_box(16, input_y, w - 32, input_h, g_chat_layout_room_encrypted);
+    blit_rows(input_y - g_line_h, h);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2759,18 +2962,33 @@ static bool handle_input_emoji_picker(bsp_input_event_t *event) {
     const int cols = EMOJI_PICKER_COLS;
     switch (event->args_navigation.key) {
         case BSP_INPUT_NAVIGATION_KEY_UP:
-            if (emoji_selected >= cols) emoji_selected -= cols;
-            return true;
+            if (emoji_selected >= cols) {
+                emoji_selected -= cols;
+                return true;
+            }
+            return false;
         case BSP_INPUT_NAVIGATION_KEY_DOWN:
-            if (emoji_selected + cols < EMOJI_CHOICE_COUNT) emoji_selected += cols;
-            else emoji_selected = EMOJI_CHOICE_COUNT - 1;
-            return true;
+            if (emoji_selected + cols < EMOJI_CHOICE_COUNT) {
+                emoji_selected += cols;
+                return true;
+            }
+            if (emoji_selected != EMOJI_CHOICE_COUNT - 1) {
+                emoji_selected = EMOJI_CHOICE_COUNT - 1;
+                return true;
+            }
+            return false;
         case BSP_INPUT_NAVIGATION_KEY_LEFT:
-            if (emoji_selected > 0) emoji_selected--;
-            return true;
+            if (emoji_selected > 0) {
+                emoji_selected--;
+                return true;
+            }
+            return false;
         case BSP_INPUT_NAVIGATION_KEY_RIGHT:
-            if (emoji_selected < EMOJI_CHOICE_COUNT - 1) emoji_selected++;
-            return true;
+            if (emoji_selected < EMOJI_CHOICE_COUNT - 1) {
+                emoji_selected++;
+                return true;
+            }
+            return false;
         case BSP_INPUT_NAVIGATION_KEY_ESC:
         case BSP_INPUT_NAVIGATION_KEY_F3:
             screen = APP_SCREEN_CHAT;
@@ -2787,7 +3005,10 @@ static bool handle_input_emoji_picker(bsp_input_event_t *event) {
 }
 
 static void render_emoji_picker(void) {
-    render_chat_frame(false);
+    if (!emoji_picker_drawn) {
+        render_chat_frame(false);
+        emoji_picker_drawn = true;
+    }
 
     float w = pax_buf_get_widthf(&fb);
     float h = pax_buf_get_heightf(&fb);
@@ -2831,7 +3052,7 @@ static void render_emoji_picker(void) {
 
         draw_emoji_icon(EMOJI_CHOICES[idx].marker, x, y, icon_s);
     }
-    blit();
+    blit_rows(panel_y - 6, panel_y + panel_h + 6);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2883,7 +3104,7 @@ static bool handle_input_menu(bsp_input_event_t *event) {
 static bool handle_input_settings(bsp_input_event_t *event) {
     if (event->type != INPUT_EVENT_TYPE_NAVIGATION || !event->args_navigation.state) return false;
 
-    const int item_count = 9;
+    const int item_count = 10;
     switch (event->args_navigation.key) {
         case BSP_INPUT_NAVIGATION_KEY_UP:
             settings_selected = (settings_selected + item_count - 1) % item_count;
@@ -2941,6 +3162,11 @@ static bool handle_input_settings(bsp_input_event_t *event) {
                 return true;
             }
             if (settings_selected == 7) {
+                auto_capitalize_sentences = !auto_capitalize_sentences;
+                save_account_settings();
+                return true;
+            }
+            if (settings_selected == 8) {
                 clear_saved_account();
                 save_account_settings();
                 return true;
@@ -2991,6 +3217,7 @@ static void render_settings(void) {
     char theme_line[96];
     char size_line[96];
     char video_line[96];
+    char auto_caps_line[96];
     snprintf(remember_line, sizeof(remember_line), "Remember account: %s", remember_account ? "on" : "off");
     snprintf(password_line, sizeof(password_line), "Remember password: %s", remember_password ? "on" : "off");
     snprintf(all_rooms_line, sizeof(all_rooms_line), "Show all rooms: %s", room_list_show_all ? "on" : "off");
@@ -2998,13 +3225,24 @@ static void render_settings(void) {
     snprintf(theme_line, sizeof(theme_line), "Theme: %s", theme_name());
     snprintf(size_line, sizeof(size_line), "Text size: %.0f", g_font_size);
     snprintf(video_line, sizeof(video_line), "Play videos (experimental): %s", video_playback_enabled ? "on" : "off");
+    snprintf(auto_caps_line, sizeof(auto_caps_line), "Start sentences uppercase: %s", auto_capitalize_sentences ? "on" : "off");
     const char *items[] = {
         remember_line, password_line, theme_line, size_line, all_rooms_line, debug_line, video_line,
-        "Clear saved account", "Back"
+        auto_caps_line, "Clear saved account", "Back"
     };
-    const int item_count = 9;
-    for (int i = 0; i < item_count; i++) {
-        float y = box_y + g_line_h * (i + 1);
+    const int item_count = 10;
+    float box_h = h - box_y - g_line_h;
+    int visible_rows = (int)((box_h - g_line_h * 0.5f) / g_line_h);
+    if (visible_rows < 1) visible_rows = 1;
+    if (settings_selected < settings_scroll) settings_scroll = settings_selected;
+    if (settings_selected >= settings_scroll + visible_rows) {
+        settings_scroll = settings_selected - visible_rows + 1;
+    }
+
+    for (int row = 0; row < visible_rows; row++) {
+        int i = settings_scroll + row;
+        if (i >= item_count) break;
+        float y = box_y + g_line_h * (row + 1);
         if (i == settings_selected) {
             pax_simple_rect(&fb, TERM_SELECT_BG, 24, y - 2, w - 64, g_line_h);
         }
@@ -3012,13 +3250,6 @@ static void render_settings(void) {
         snprintf(line, sizeof(line), "%s%s", i == settings_selected ? "> " : "  ", items[i]);
         pax_draw_text(&fb, i == settings_selected ? TERM_GREEN : TERM_FG, pax_font_sky_mono, FONT_SIZE, 32, y, line);
     }
-
-    char saved_server[96];
-    char saved_user[96];
-    snprintf(saved_server, sizeof(saved_server), "Server: %.80s", login_homeserver);
-    snprintf(saved_user, sizeof(saved_user), "User: %.82s", login_username[0] ? login_username : "(none)");
-    pax_draw_text(&fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, 32, box_y + g_line_h * 9, saved_server);
-    pax_draw_text(&fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, 32, box_y + g_line_h * 10, saved_user);
 
     blit();
 }
@@ -3169,6 +3400,7 @@ static bool handle_global_hotkeys(bsp_input_event_t *event) {
             if (screen == APP_SCREEN_CHAT && !login_in_progress) {
                 emoji_selected = 0;
                 emoji_scroll   = 0;
+                emoji_picker_drawn = false;
                 screen         = APP_SCREEN_EMOJI_PICKER;
                 return true;
             }
@@ -3197,6 +3429,22 @@ static void render(void) {
     }
 }
 
+static bool dispatch_input_event(bsp_input_event_t *event) {
+    if (handle_global_hotkeys(event)) return true;
+
+    switch (screen) {
+        case APP_SCREEN_LOGIN: return handle_input_login(event);
+        case APP_SCREEN_ROOM_LIST: return handle_input_room_list(event);
+        case APP_SCREEN_CHAT: return handle_input_chat(event);
+        case APP_SCREEN_IMAGE_VIEWER: return handle_input_image_viewer(event);
+        case APP_SCREEN_VIDEO_PLAYER: return handle_input_video_player(event);
+        case APP_SCREEN_EMOJI_PICKER: return handle_input_emoji_picker(event);
+        case APP_SCREEN_MENU: return handle_input_menu(event);
+        case APP_SCREEN_SETTINGS: return handle_input_settings(event);
+    }
+    return false;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Entry point                                                                 */
 /* -------------------------------------------------------------------------- */
@@ -3221,8 +3469,8 @@ void app_main(void) {
     const bsp_configuration_t bsp_configuration = {
         .display =
             {
-                .requested_color_format = BSP_DISPLAY_COLOR_FORMAT_24_888RGB,
-                .num_fbs                = 1,
+                .requested_color_format = BSP_DISPLAY_COLOR_FORMAT_16_565RGB,
+                .num_fbs                = 2,
             },
     };
     res = bsp_device_initialize(&bsp_configuration);
@@ -3264,7 +3512,24 @@ void app_main(void) {
         default: orientation = PAX_O_UPRIGHT; break;
     }
 
-    pax_buf_init(&fb, NULL, display_h_res, display_v_res, format);
+    void *display_framebuffer = NULL;
+    esp_lcd_panel_handle_t display_panel = NULL;
+    if (bsp_display_get_panel(&display_panel) == ESP_OK) {
+        esp_err_t fb_res = esp_lcd_dpi_panel_get_frame_buffer(
+            display_panel, 2, &g_display_buffers[0], &g_display_buffers[1], NULL
+        );
+        if (fb_res != ESP_OK) {
+            ESP_LOGW(TAG, "Could not use double display buffering: %s", esp_err_to_name(fb_res));
+            g_display_buffers[0] = NULL;
+            g_display_buffers[1] = NULL;
+        } else {
+            g_display_draw_buffer = 1;
+            display_framebuffer = g_display_buffers[g_display_draw_buffer];
+            g_display_buffer_size = display_h_res * display_v_res * (display_color_format == BSP_DISPLAY_COLOR_FORMAT_16_565RGB ? 2 : 3);
+            bsp_display_get_tearing_effect_semaphore(&g_display_te_semaphore);
+        }
+    }
+    pax_buf_init(&fb, display_framebuffer, display_h_res, display_v_res, format);
     pax_buf_reversed(&fb, display_data_endian == BSP_DISPLAY_ENDIAN_BIG);
     pax_buf_set_orientation(&fb, orientation);
 
@@ -3312,21 +3577,9 @@ void app_main(void) {
         bsp_input_event_t event;
         bool               need_redraw = false;
 
-        if (xQueueReceive(input_event_queue, &event, pdMS_TO_TICKS(200)) == pdTRUE) {
-            if (handle_global_hotkeys(&event)) {
-                need_redraw = true;
-            } else {
-                switch (screen) {
-                    case APP_SCREEN_LOGIN: need_redraw = handle_input_login(&event); break;
-                    case APP_SCREEN_ROOM_LIST: need_redraw = handle_input_room_list(&event); break;
-                    case APP_SCREEN_CHAT: need_redraw = handle_input_chat(&event); break;
-                    case APP_SCREEN_IMAGE_VIEWER: need_redraw = handle_input_image_viewer(&event); break;
-                    case APP_SCREEN_VIDEO_PLAYER: need_redraw = handle_input_video_player(&event); break;
-                    case APP_SCREEN_EMOJI_PICKER: need_redraw = handle_input_emoji_picker(&event); break;
-                    case APP_SCREEN_MENU: need_redraw = handle_input_menu(&event); break;
-                    case APP_SCREEN_SETTINGS: need_redraw = handle_input_settings(&event); break;
-                }
-            }
+        TickType_t input_wait = compose_redraw_pending ? pdMS_TO_TICKS(10) : pdMS_TO_TICKS(200);
+        if (xQueueReceive(input_event_queue, &event, input_wait) == pdTRUE) {
+            need_redraw = dispatch_input_event(&event);
         }
 
         if (was_logging_in && !login_in_progress) {
@@ -3344,6 +3597,15 @@ void app_main(void) {
         if (image_decode_ready) {
             image_decode_ready = false;
             need_redraw = true;
+        }
+
+        if (compose_redraw_pending) {
+            if (need_redraw || screen != APP_SCREEN_CHAT) {
+                compose_redraw_pending = false;
+            } else if (esp_timer_get_time() >= compose_redraw_at_us) {
+                render_chat_input_only();
+                compose_redraw_pending = false;
+            }
         }
 
         if (need_redraw) {

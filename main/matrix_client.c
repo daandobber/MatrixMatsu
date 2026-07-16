@@ -205,44 +205,47 @@ static bool matrix_history_cache_path(const char *room_id, char *out, size_t out
     return len > 0 && len < (int)out_len;
 }
 
-static void matrix_load_history_cache(const char *room_id) {
-    if (s_session == NULL || room_id == NULL || room_id[0] == '\0') return;
+static int matrix_load_history_cache(const char *room_id) {
+    if (s_session == NULL || room_id == NULL || room_id[0] == '\0') return 0;
 
     char path[96];
-    if (!matrix_history_cache_path(room_id, path, sizeof(path))) return;
+    if (!matrix_history_cache_path(room_id, path, sizeof(path))) return 0;
 
     FILE *file = fopen(path, "rb");
-    if (file == NULL) return;
+    if (file == NULL) return 0;
 
     matrix_history_cache_header_t header = {0};
     if (fread(&header, 1, sizeof(header), file) != sizeof(header) ||
         header.magic != MATRIX_HISTORY_CACHE_MAGIC || header.version != MATRIX_HISTORY_CACHE_VERSION ||
         header.count > MATRIX_ACTIVE_HISTORY_MESSAGES) {
         fclose(file);
-        return;
+        return 0;
     }
 
     matrix_message_t *messages = heap_caps_calloc(header.count, sizeof(*messages), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (messages == NULL) {
         fclose(file);
-        return;
+        return 0;
     }
     size_t byte_count = sizeof(*messages) * header.count;
     size_t got        = fread(messages, 1, byte_count, file);
     fclose(file);
     if (got != byte_count) {
         free(messages);
-        return;
+        return 0;
     }
 
+    int loaded_count = 0;
     matrix_lock();
     if (strcmp(s_session->active_history_room_id, room_id) == 0) {
         s_session->active_history_count = (int)header.count;
         memcpy(s_session->active_history, messages, byte_count);
         s_session->dirty = true;
+        loaded_count = (int)header.count;
     }
     matrix_unlock();
     free(messages);
+    return loaded_count;
 }
 
 static void matrix_save_history_cache(const char *room_id) {
@@ -1758,9 +1761,16 @@ static void process_sync_body(const char *body) {
         sort_rooms_by_activity();
     }
     bool force_persist = s_session->sync_count <= 1 || counts.messages > 0;
+    char active_cache_room_id[MATRIX_ROOM_ID_LEN] = "";
+    if (counts.messages > 0 && s_session->active_history_count > 0) {
+        snprintf(active_cache_room_id, sizeof(active_cache_room_id), "%s", s_session->active_history_room_id);
+    }
     s_session->dirty = true;
     matrix_unlock();
     persist_session(force_persist);
+    if (active_cache_room_id[0] != '\0') {
+        matrix_save_history_cache(active_cache_room_id);
+    }
 
     cJSON_Delete(root);
 }
@@ -2896,7 +2906,12 @@ esp_err_t matrix_fetch_room_history(int room_index) {
     s_session->dirty = true;
     matrix_unlock();
 
-    matrix_load_history_cache(req->room_id);
+    int cached_count = matrix_load_history_cache(req->room_id);
+    if (cached_count > 0) {
+        ESP_LOGI(TAG, "Loaded %d cached messages for %s", cached_count, req->room_id);
+        free(req);
+        return ESP_OK;
+    }
 
     BaseType_t ok = xTaskCreate(history_task, "matrix_history", 12288, req, 4, NULL);
     if (ok != pdPASS) {
