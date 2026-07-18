@@ -8,6 +8,7 @@ idf_component_register(
 	SRCS
 		"audio_output.cpp"
 		"audio_player_decode.cpp"
+		"dobber_splash.c"
 		"image_viewer.c"
 		"main.c"
 		"matrix_client.c"

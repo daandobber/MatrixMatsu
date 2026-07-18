@@ -9,6 +9,7 @@
 #include "bsp/input.h"
 #include "bsp/power.h"
 #include "custom_certificates.h"
+#include "dobber_splash.h"
 #include "driver/sdmmc_host.h"
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
@@ -28,6 +29,7 @@
 #include "nvs_flash.h"
 #include "pax_fonts.h"
 #include "pax_gfx.h"
+#include "pax_orientation.h"
 #include "pax_text.h"
 #include "pax_types.h"
 #include "portmacro.h"
@@ -74,7 +76,9 @@ static float                      g_line_h             = 20.0f;
 static void                      *g_display_buffers[2] = {NULL, NULL};
 static int                        g_display_draw_buffer = 0;
 static size_t                     g_display_buffer_size = 0;
+static size_t                     g_display_bytes_per_pixel = 0;
 static SemaphoreHandle_t          g_display_te_semaphore = NULL;
+static bool                       g_display_te_enabled = false;
 
 // Scratch buffers used only by render_chat(), allocated once from PSRAM.
 static char      (*g_all_lines)[WRAP_LINE_LEN] = NULL;
@@ -168,6 +172,7 @@ static bool g_chat_layout_room_encrypted = false;
 
 static void blit(void);
 static void blit_rows(float y_start, float y_end);
+static void show_startup_progress(uint8_t percent);
 static void measure_font(void);
 static void draw_box(float x, float y, float w, float h, pax_col_t color, const char *title);
 static const char *matrix_state_text(matrix_state_t state);
@@ -214,38 +219,147 @@ static void render_settings(void);
 /* Small helpers                                                               */
 /* -------------------------------------------------------------------------- */
 
-static void blit(void) {
+static void logical_to_physical_region(
+    float x_start,
+    float y_start,
+    float x_end,
+    float y_end,
+    int *physical_x_start,
+    int *physical_y_start,
+    int *physical_x_end,
+    int *physical_y_end
+) {
+    int logical_width = pax_buf_get_width(&fb);
+    int logical_height = pax_buf_get_height(&fb);
+    int x0 = (int)floorf(x_start);
+    int y0 = (int)floorf(y_start);
+    int x1 = (int)ceilf(x_end) - 1;
+    int y1 = (int)ceilf(y_end) - 1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= logical_width) x1 = logical_width - 1;
+    if (y1 >= logical_height) y1 = logical_height - 1;
+    if (x1 < x0) x1 = x0;
+    if (y1 < y0) y1 = y0;
+
+    pax_vec2i corners[] = {
+        pax_orient_det_vec2i(&fb, (pax_vec2i){x0, y0}),
+        pax_orient_det_vec2i(&fb, (pax_vec2i){x1, y0}),
+        pax_orient_det_vec2i(&fb, (pax_vec2i){x0, y1}),
+        pax_orient_det_vec2i(&fb, (pax_vec2i){x1, y1}),
+    };
+    int min_x = corners[0].x;
+    int max_x = corners[0].x;
+    int min_y = corners[0].y;
+    int max_y = corners[0].y;
+    for (size_t i = 1; i < sizeof(corners) / sizeof(corners[0]); i++) {
+        if (corners[i].x < min_x) min_x = corners[i].x;
+        if (corners[i].x > max_x) max_x = corners[i].x;
+        if (corners[i].y < min_y) min_y = corners[i].y;
+        if (corners[i].y > max_y) max_y = corners[i].y;
+    }
+    *physical_x_start = min_x;
+    *physical_y_start = min_y;
+    *physical_x_end = max_x + 1;
+    *physical_y_end = max_y + 1;
+}
+
+static void copy_display_region(
+    int source_index,
+    int destination_index,
+    int x_start,
+    int y_start,
+    int x_end,
+    int y_end
+) {
+    uint8_t *source = g_display_buffers[source_index];
+    uint8_t *destination = g_display_buffers[destination_index];
+    if (source == NULL || destination == NULL || g_display_bytes_per_pixel == 0) return;
+
+    if (x_start == 0 && y_start == 0 && x_end == (int)display_h_res && y_end == (int)display_v_res) {
+        memcpy(destination, source, g_display_buffer_size);
+        return;
+    }
+
+    size_t stride = display_h_res * g_display_bytes_per_pixel;
+    size_t row_bytes = (size_t)(x_end - x_start) * g_display_bytes_per_pixel;
+    size_t offset = (size_t)y_start * stride + (size_t)x_start * g_display_bytes_per_pixel;
+    for (int y = y_start; y < y_end; y++) {
+        memcpy(destination + offset, source + offset, row_bytes);
+        offset += stride;
+    }
+}
+
+static void blit_region(float x_start, float y_start, float x_end, float y_end) {
+    int physical_x_start = 0;
+    int physical_y_start = 0;
+    int physical_x_end = (int)display_h_res;
+    int physical_y_end = (int)display_v_res;
+    bool direct_double_buffer = g_display_buffers[0] != NULL && g_display_buffers[1] != NULL;
+    if (direct_double_buffer) {
+        logical_to_physical_region(
+            x_start,
+            y_start,
+            x_end,
+            y_end,
+            &physical_x_start,
+            &physical_y_start,
+            &physical_x_end,
+            &physical_y_end
+        );
+    }
+
     if (g_display_buffers[0] != NULL && g_display_buffers[1] != NULL && g_display_te_semaphore != NULL) {
         while (xSemaphoreTake(g_display_te_semaphore, 0) == pdTRUE) {
         }
     }
-    esp_err_t res = bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
+    esp_err_t res = bsp_display_blit(
+        physical_x_start,
+        physical_y_start,
+        physical_x_end,
+        physical_y_end,
+        pax_buf_get_pixels(&fb)
+    );
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Failed to blit to display: %d", res);
         return;
     }
 
-    if (g_display_buffers[0] != NULL && g_display_buffers[1] != NULL) {
-        // The DPI driver switches to the selected framebuffer on a frame
-        // boundary. Wait for that boundary before reusing the old frontbuffer.
-        if (g_display_te_semaphore != NULL) {
-            xSemaphoreTake(g_display_te_semaphore, pdMS_TO_TICKS(40));
+    if (direct_double_buffer) {
+        // Wait until the panel has started using the submitted framebuffer
+        // before drawing into the previous one. TE is explicitly enabled at
+        // startup; without that, every keypress used to hit the old 40 ms
+        // timeout and made navigation feel sticky.
+        if (g_display_te_enabled && g_display_te_semaphore != NULL) {
+            xSemaphoreTake(g_display_te_semaphore, pdMS_TO_TICKS(20));
         } else {
             vTaskDelay(pdMS_TO_TICKS(17));
         }
 
         int next = 1 - g_display_draw_buffer;
-        memcpy(g_display_buffers[next], g_display_buffers[g_display_draw_buffer], g_display_buffer_size);
+        copy_display_region(
+            g_display_draw_buffer,
+            next,
+            physical_x_start,
+            physical_y_start,
+            physical_x_end,
+            physical_y_end
+        );
         g_display_draw_buffer = next;
         fb.buf = g_display_buffers[g_display_draw_buffer];
     }
 }
 
-// The Tanmatsu framebuffer is rotated in software. Its logical horizontal
-// bands are non-contiguous physically, so use a stable full-frame transfer.
+static void blit(void) {
+    blit_region(0, 0, pax_buf_get_width(&fb), pax_buf_get_height(&fb));
+}
+
 static void blit_rows(float y_start, float y_end) {
-    (void)y_start;
-    (void)y_end;
+    blit_region(0, y_start, pax_buf_get_width(&fb), y_end);
+}
+
+static void show_startup_progress(uint8_t percent) {
+    dobber_splash_render(&fb, percent);
     blit();
 }
 
@@ -3452,20 +3566,6 @@ static bool dispatch_input_event(bsp_input_event_t *event) {
 void app_main(void) {
     gpio_install_isr_service(0);
 
-    esp_err_t res = nvs_flash_init();
-    if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        res = nvs_flash_erase();
-        if (res != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to erase NVS flash: %d", res);
-            return;
-        }
-        res = nvs_flash_init();
-    }
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize NVS flash: %d", res);
-        return;
-    }
-
     const bsp_configuration_t bsp_configuration = {
         .display =
             {
@@ -3473,7 +3573,7 @@ void app_main(void) {
                 .num_fbs                = 2,
             },
     };
-    res = bsp_device_initialize(&bsp_configuration);
+    esp_err_t res = bsp_device_initialize(&bsp_configuration);
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize BSP: %d", res);
         return;
@@ -3491,10 +3591,20 @@ void app_main(void) {
 
     pax_buf_type_t format = PAX_BUF_24_888RGB;
     switch (display_color_format) {
-        case BSP_DISPLAY_COLOR_FORMAT_16_565RGB: format = PAX_BUF_16_565RGB; break;
-        case BSP_DISPLAY_COLOR_FORMAT_24_888RGB: format = PAX_BUF_24_888RGB; break;
-        case BSP_DISPLAY_COLOR_FORMAT_32_8888ARGB: format = PAX_BUF_32_8888ARGB; break;
+        case BSP_DISPLAY_COLOR_FORMAT_16_565RGB:
+            format = PAX_BUF_16_565RGB;
+            g_display_bytes_per_pixel = 2;
+            break;
+        case BSP_DISPLAY_COLOR_FORMAT_24_888RGB:
+            format = PAX_BUF_24_888RGB;
+            g_display_bytes_per_pixel = 3;
+            break;
+        case BSP_DISPLAY_COLOR_FORMAT_32_8888ARGB:
+            format = PAX_BUF_32_8888ARGB;
+            g_display_bytes_per_pixel = 4;
+            break;
         default:
+            g_display_bytes_per_pixel = 3;
             ESP_LOGW(
                 TAG, "BSP requests color format not explicitly handled (%u), defaulting to 24-bit RGB",
                 display_color_format
@@ -3525,21 +3635,41 @@ void app_main(void) {
         } else {
             g_display_draw_buffer = 1;
             display_framebuffer = g_display_buffers[g_display_draw_buffer];
-            g_display_buffer_size = display_h_res * display_v_res * (display_color_format == BSP_DISPLAY_COLOR_FORMAT_16_565RGB ? 2 : 3);
-            bsp_display_get_tearing_effect_semaphore(&g_display_te_semaphore);
+            g_display_buffer_size = display_h_res * display_v_res * g_display_bytes_per_pixel;
+            if (bsp_display_get_tearing_effect_semaphore(&g_display_te_semaphore) == ESP_OK &&
+                bsp_display_set_tearing_effect_mode(BSP_DISPLAY_TE_V_BLANKING) == ESP_OK) {
+                g_display_te_enabled = true;
+            } else {
+                g_display_te_semaphore = NULL;
+                ESP_LOGW(TAG, "Display TE synchronization unavailable; using frame delay fallback");
+            }
         }
     }
     pax_buf_init(&fb, display_framebuffer, display_h_res, display_v_res, format);
     pax_buf_reversed(&fb, display_data_endian == BSP_DISPLAY_ENDIAN_BIG);
     pax_buf_set_orientation(&fb, orientation);
 
+    show_startup_progress(0);
+
+    res = nvs_flash_init();
+    if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        res = nvs_flash_erase();
+        if (res != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to erase NVS flash: %d", res);
+            return;
+        }
+        res = nvs_flash_init();
+    }
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize NVS flash: %d", res);
+        return;
+    }
+    show_startup_progress(15);
+
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
     measure_font();
-
-    pax_background(&fb, BLACK);
-    pax_draw_text(&fb, TERM_GREEN, pax_font_sky_mono, FONT_SIZE, 16, 16, "Connecting to WiFi...");
-    blit();
+    show_startup_progress(25);
 
     if (wifi_remote_initialize() == ESP_OK) {
         wifi_connection_init_stack();
@@ -3548,16 +3678,19 @@ void app_main(void) {
         bsp_power_set_radio_state(BSP_POWER_RADIO_STATE_OFF);
         ESP_LOGE(TAG, "WiFi radio not responding, WiFi not available");
     }
+    show_startup_progress(55);
 
     load_saved_account();
     ESP_ERROR_CHECK(matrix_client_init());
     matrix_set_persistence_enabled(remember_password);
     matrix_set_video_playback_enabled(video_playback_enabled);
+    show_startup_progress(70);
     bool restored_session = false;
     if (remember_password && matrix_restore_session() == ESP_OK) {
         restored_session = true;
         matrix_start_sync();
     }
+    show_startup_progress(85);
 
     g_all_lines   = heap_caps_calloc(MAX_WRAP_LINES_TOTAL, sizeof(*g_all_lines), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     g_line_colors = heap_caps_calloc(MAX_WRAP_LINES_TOTAL, sizeof(*g_line_colors), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -3568,8 +3701,11 @@ void app_main(void) {
         g_line_message_indices == NULL) {
         ESP_LOGE(TAG, "Failed to allocate chat render buffers");
     }
+    show_startup_progress(95);
 
     screen = restored_session ? APP_SCREEN_ROOM_LIST : APP_SCREEN_LOGIN;
+    show_startup_progress(100);
+    vTaskDelay(pdMS_TO_TICKS(180));
     render();
 
     bool was_logging_in = false;
