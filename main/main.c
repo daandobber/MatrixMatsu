@@ -2038,7 +2038,7 @@ static void schedule_compose_redraw(void) {
     compose_redraw_pending = true;
 }
 
-static void append_keyboard_text(char *text, size_t cap, bsp_input_event_t *event) {
+static void append_keyboard_text(char *text, size_t cap, bsp_input_event_t *event, bool capitalize_sentence) {
     const char *piece = event->args_keyboard.utf8;
     char        ascii_piece[2];
     if (piece == NULL || piece[0] == '\0') {
@@ -2060,9 +2060,36 @@ static void append_keyboard_text(char *text, size_t cap, bsp_input_event_t *even
         else if (isalnum(ch)) sentence_start = false;
     }
     memcpy(text + len, piece, piece_len + 1);
-    if (auto_capitalize_sentences && sentence_start && text[len] >= 'a' && text[len] <= 'z') {
+    if (capitalize_sentence && sentence_start && text[len] >= 'a' && text[len] <= 'z') {
         text[len] = (char)(text[len] - 'a' + 'A');
     }
+}
+
+static void format_password_preview(const char *password, char *output, size_t output_size) {
+    if (output_size == 0) return;
+    output[0] = '\0';
+
+    size_t length = strlen(password);
+    if (length == 0) return;
+
+    size_t last_start = length - 1;
+    while (last_start > 0 && ((unsigned char)password[last_start] & 0xC0) == 0x80) {
+        last_start--;
+    }
+
+    size_t output_pos = 0;
+    for (size_t input_pos = 0; input_pos < last_start && output_pos + 1 < output_size;) {
+        output[output_pos++] = '*';
+        input_pos++;
+        while (input_pos < last_start && ((unsigned char)password[input_pos] & 0xC0) == 0x80) {
+            input_pos++;
+        }
+    }
+
+    size_t last_length = length - last_start;
+    if (last_length > output_size - output_pos - 1) last_length = output_size - output_pos - 1;
+    memcpy(output + output_pos, password + last_start, last_length);
+    output[output_pos + last_length] = '\0';
 }
 
 static void append_text_piece(char *text, size_t cap, const char *piece) {
@@ -2283,7 +2310,7 @@ static bool handle_input_login(bsp_input_event_t *event) {
         if ((unsigned char)ascii >= 0x20 || (event->args_keyboard.utf8 != NULL && event->args_keyboard.utf8[0] != '\0')) {
             char  *buf = login_field_buffer(login_focus);
             size_t cap = login_field_capacity(login_focus);
-            append_keyboard_text(buf, cap, event);
+            append_keyboard_text(buf, cap, event, false);
             return true;
         }
     }
@@ -2312,10 +2339,7 @@ static void render_login(void) {
         char        line[192];
         if (i == LOGIN_FIELD_PASSWORD) {
             char   masked[sizeof(login_password)];
-            size_t len = strlen(login_password);
-            if (len >= sizeof(masked)) len = sizeof(masked) - 1;
-            memset(masked, '*', len);
-            masked[len] = '\0';
+            format_password_preview(login_password, masked, sizeof(masked));
             snprintf(line, sizeof(line), "%s %s%s", labels[i], masked, cursor);
         } else {
             snprintf(line, sizeof(line), "%s %s%s", labels[i], login_field_buffer((login_field_t)i), cursor);
@@ -2808,7 +2832,12 @@ static bool handle_input_chat(bsp_input_event_t *event) {
         }
         if ((unsigned char)ascii >= 0x20 || (event->args_keyboard.utf8 != NULL && event->args_keyboard.utf8[0] != '\0')) {
             size_t old_len = strlen(compose_buffer);
-            append_keyboard_text(compose_buffer, sizeof(compose_buffer), event);
+            append_keyboard_text(
+                compose_buffer,
+                sizeof(compose_buffer),
+                event,
+                auto_capitalize_sentences
+            );
             if (strlen(compose_buffer) != old_len) schedule_compose_redraw();
             return false;
         }
